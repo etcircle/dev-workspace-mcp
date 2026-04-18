@@ -8,8 +8,10 @@ from dev_workspace_mcp.mcp_server.transport_http import mount_http_transport
 
 EXPECTED_TOOL_NAMES = [
     "apply_patch",
+    "bootstrap_project",
     "call_path",
     "cancel_job",
+    "configure_connection",
     "delete_path",
     "find_references",
     "function_context",
@@ -21,6 +23,7 @@ EXPECTED_TOOL_NAMES = [
     "git_status",
     "grep",
     "http_request",
+    "list_connections",
     "list_dir",
     "list_probes",
     "list_projects",
@@ -39,6 +42,7 @@ EXPECTED_TOOL_NAMES = [
     "service_status",
     "start_service",
     "stop_service",
+    "test_connection",
     "watcher_health",
     "write_file",
     "write_state_doc",

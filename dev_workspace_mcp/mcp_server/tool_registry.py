@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel, ValidationError
 
 from dev_workspace_mcp.codegraph.service import CodegraphService
 from dev_workspace_mcp.commands.service import CommandService
@@ -13,7 +16,12 @@ from dev_workspace_mcp.http_tools.local_client import LocalHttpClient
 from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.mcp_server.result_envelope import error_result, ok
 from dev_workspace_mcp.models.common import WarningMessage
-from dev_workspace_mcp.models.errors import ErrorCode
+from dev_workspace_mcp.models.connections import (
+    ConfigureConnectionRequest,
+    TestConnectionRequest,
+)
+from dev_workspace_mcp.models.errors import ErrorCode, ValidationIssue
+from dev_workspace_mcp.models.project_bootstrap import BootstrapProjectRequest
 from dev_workspace_mcp.models.projects import WatcherSummary
 from dev_workspace_mcp.models.state_docs import StateDocKind
 from dev_workspace_mcp.projects.snapshots import build_project_snapshot
@@ -50,6 +58,7 @@ class ToolRegistry:
                     message=f"Unknown tool: {name}",
                     hint="Use the registered tool names exposed by the server.",
                 )
+            _validate_tool_arguments(tool, kwargs)
             return tool.handler(**kwargs)
         except DomainError as exc:
             return error_result(exc)
@@ -76,6 +85,8 @@ def build_tool_registry(
     probe_service = runtime_services.probe_service
     codegraph_service = runtime_services.codegraph_service
     http_client = runtime_services.http_client
+    bootstrap_service = runtime_services.bootstrap_service
+    connection_service = runtime_services.connection_service
 
     registry.register(
         ToolDefinition(
@@ -84,6 +95,13 @@ def build_tool_registry(
             handler=lambda project_id, patch: ok(
                 _file_service(project_registry, project_id).apply_patch(patch)
             ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="bootstrap_project",
+            description="Create, clone, or import a project into the workspace roots.",
+            handler=_make_bootstrap_project_handler(bootstrap_service),
         )
     )
     registry.register(
@@ -100,6 +118,13 @@ def build_tool_registry(
             name="cancel_job",
             description="Cancel a running background job.",
             handler=lambda project_id, job_id: ok(command_service.cancel_job(project_id, job_id)),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="configure_connection",
+            description="Create or update one tracked direct connection profile for a project.",
+            handler=_make_configure_connection_handler(connection_service),
         )
     )
     registry.register(
@@ -248,6 +273,13 @@ def build_tool_registry(
                     limit=limit,
                 )
             ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="list_connections",
+            description="List tracked connection profiles for a project.",
+            handler=lambda project_id: ok(connection_service.list_connections(project_id)),
         )
     )
     registry.register(
@@ -428,6 +460,13 @@ def build_tool_registry(
     )
     registry.register(
         ToolDefinition(
+            name="test_connection",
+            description="Resolve and smoke-test one direct connection profile with a TCP dial.",
+            handler=_make_test_connection_handler(connection_service),
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="watcher_health",
             description="Report codegraph watcher configuration and current activity state.",
             handler=lambda project_id: ok(codegraph_service.watcher_health(project_id)),
@@ -524,6 +563,79 @@ def _http_request(
 
 
 
+def _make_bootstrap_project_handler(bootstrap_service) -> ToolHandler:
+    def _handler(
+        mode,
+        folder_name=None,
+        repo_url=None,
+        path=None,
+        branch=None,
+        project_id=None,
+        display_name=None,
+        git_init=False,
+        template=None,
+    ) -> dict[str, Any]:
+        return ok(
+            bootstrap_service.bootstrap_project(
+                _validated_model(
+                    BootstrapProjectRequest,
+                    {
+                        "mode": mode,
+                        "folder_name": folder_name,
+                        "repo_url": repo_url,
+                        "path": path,
+                        "branch": branch,
+                        "project_id": project_id,
+                        "display_name": display_name,
+                        "git_init": git_init,
+                        "template": template,
+                    },
+                    tool_name="bootstrap_project",
+                )
+            )
+        )
+
+    return _handler
+
+
+def _make_configure_connection_handler(connection_service) -> ToolHandler:
+    def _handler(project_id, connection_name, profile, env_updates=None) -> dict[str, Any]:
+        return ok(
+            connection_service.configure_connection(
+                _validated_model(
+                    ConfigureConnectionRequest,
+                    {
+                        "project_id": project_id,
+                        "connection_name": connection_name,
+                        "profile": profile,
+                        "env_updates": env_updates or {},
+                    },
+                    tool_name="configure_connection",
+                )
+            )
+        )
+
+    return _handler
+
+
+def _make_test_connection_handler(connection_service) -> ToolHandler:
+    def _handler(project_id, connection_name) -> dict[str, Any]:
+        return ok(
+            connection_service.test_connection(
+                _validated_model(
+                    TestConnectionRequest,
+                    {
+                        "project_id": project_id,
+                        "connection_name": connection_name,
+                    },
+                    tool_name="test_connection",
+                )
+            )
+        )
+
+    return _handler
+
+
 def _make_run_command_handler(command_service: CommandService) -> ToolHandler:
     def _handler(
         project_id,
@@ -547,6 +659,72 @@ def _make_run_command_handler(command_service: CommandService) -> ToolHandler:
         )
 
     return _handler
+
+
+
+def _validated_model(
+    model_type: type[BaseModel],
+    payload: dict[str, Any],
+    *,
+    tool_name: str,
+) -> BaseModel:
+    try:
+        return model_type.model_validate(payload)
+    except ValidationError as exc:
+        raise DomainError(
+            code=ErrorCode.VALIDATION_ERROR,
+            message=f"Invalid arguments for tool: {tool_name}",
+            hint="Check the required fields and value formats for this tool.",
+            details={
+                "issues": [
+                    issue.model_dump(mode="json") for issue in _validation_issues(exc)
+                ]
+            },
+        ) from exc
+
+
+def _validate_tool_arguments(tool: ToolDefinition, kwargs: dict[str, Any]) -> None:
+    try:
+        inspect.signature(tool.handler).bind(**kwargs)
+    except TypeError as exc:
+        raise DomainError(
+            code=ErrorCode.VALIDATION_ERROR,
+            message=f"Invalid arguments for tool: {tool.name}",
+            hint="Check the required fields and value formats for this tool.",
+            details={
+                "issues": [
+                    ValidationIssue(
+                        field="__args__",
+                        message=str(exc),
+                    ).model_dump(mode="json")
+                ]
+            },
+        ) from exc
+
+
+
+def _validation_issues(exc: ValidationError) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    for entry in exc.errors(include_url=False):
+        field = ".".join(str(part) for part in entry.get("loc", ()) if str(part))
+        if not field:
+            field = _infer_validation_field(entry.get("msg", ""))
+        issues.append(
+            ValidationIssue(
+                field=field or "__root__",
+                message=entry.get("msg", "Invalid value."),
+            )
+        )
+    return issues
+
+
+
+def _infer_validation_field(message: str) -> str:
+    normalized = message.removeprefix("Value error, ")
+    field_candidate = normalized.split(" ", 1)[0].strip()
+    if not field_candidate or not field_candidate.replace("_", "").isalnum():
+        return ""
+    return field_candidate
 
 
 

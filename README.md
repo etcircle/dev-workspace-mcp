@@ -175,6 +175,7 @@ Recommended rule:
 ## Public MCP tool surface
 
 ### Project tools
+- `bootstrap_project`
 - `list_projects`
 - `project_snapshot`
 
@@ -213,6 +214,11 @@ Recommended rule:
 - `http_request`
 - `list_probes`
 - `run_probe`
+
+### Connection tools
+- `list_connections`
+- `configure_connection`
+- `test_connection`
 
 ### Git tools
 - `git_status`
@@ -293,12 +299,44 @@ CLI notes:
 - `--json` pretty-prints the same envelope for humans
 - current CLI parity slice is intentionally small and honest:
   - `projects`
+  - `bootstrap create <folder_name> [--project-id ...] [--display-name ...] [--git-init]`
+  - `bootstrap clone <repo_url> [--branch ...] [--project-id ...] [--display-name ...]`
+  - `bootstrap import <path> [--project-id ...] [--display-name ...]`
   - `snapshot <project_id>`
   - `read <project_id> <path>`
   - `run <project_id> -- ...`
+  - `connections list <project_id>`
+  - `connections configure <project_id> <connection_name> --kind ... --host-env ... --port-env ... [--env KEY=VALUE ...]`
+  - `connections test <project_id> <connection_name>`
   - `git status <project_id>`
   - `memory read <project_id>`
   - `memory patch <project_id> --section ...`
+
+Quick CLI examples:
+
+```bash
+# create / clone / import
+python -m dev_workspace_mcp.app cli bootstrap create scratch-api --project-id scratch-api --git-init
+python -m dev_workspace_mcp.app cli bootstrap clone https://github.com/example/service.git --project-id example-service
+python -m dev_workspace_mcp.app cli bootstrap import ~/dev-workspaces/existing-app --project-id existing-app
+
+# track one direct connection profile
+python -m dev_workspace_mcp.app cli connections configure di-copilot primary-db \
+  --kind postgres \
+  --host-env DB_HOST \
+  --port-env DB_PORT \
+  --database-env DB_NAME \
+  --user-env DB_USER \
+  --password-env DB_PASSWORD \
+  --env DB_HOST=127.0.0.1 \
+  --env DB_PORT=5432
+
+python -m dev_workspace_mcp.app cli connections list di-copilot
+python -m dev_workspace_mcp.app cli connections test di-copilot primary-db
+```
+
+Tracked connection profiles store env variable names in `.devworkspace.yaml`. Local values live in `.devworkspace/agent.env` and are gitignored.
+`test_connection` / `connections test` only do a direct TCP dial today. SSH tunnel lifecycle is not implemented in this wave.
 
 ## Manifest example
 
@@ -344,7 +382,23 @@ presets:
   test_backend: ["pytest", "-q"]
   test_frontend: ["pnpm", "test"]
   build_frontend: ["pnpm", "build"]
+
+connections:
+  primary_db:
+    kind: postgres
+    transport: direct
+    host_env: DB_HOST
+    port_env: DB_PORT
+    database_env: DB_NAME
+    user_env: DB_USER
+    password_env: DB_PASSWORD
+    ssl_mode_env: DB_SSLMODE
+    test:
+      type: tcp
+      timeout_sec: 3
 ```
+
+The manifest tracks connection profile metadata and env var names only. Put local values in `.devworkspace/agent.env`, not in `.devworkspace.yaml`.
 
 ## Safety model
 
@@ -466,6 +520,7 @@ The job is much simpler: be an excellent remote development workspace MCP server
 
 This repository now has a working local implementation of:
 
+- project bootstrap (`bootstrap_project`) for create / clone / import flows
 - project discovery, alias resolution, and richer project snapshots
 - policy-aware path safety, environment filtering, and local-network restrictions
 - first semantic code tools (`module_overview`, `function_context`, `grep`, `find_references`, `read_source`, `recent_changes`, `call_path`, `watcher_health`)
@@ -477,10 +532,18 @@ This repository now has a working local implementation of:
 - git tools
 - local HTTP verification
 - manifest-declared probes
+- tracked direct connection profiles in `.devworkspace.yaml`
+- local connection/env values in `.devworkspace/agent.env`
+- direct TCP smoke testing for tracked connections
 - native Streamable HTTP MCP transport wiring
 - native stdio MCP transport wiring
-- a small in-process JSON-first CLI parity slice
+- a small in-process JSON-first CLI parity slice, including bootstrap and connection helpers
 - a `project_snapshot` boot packet that summarizes stack, repo guidance, memory, active tasks, services, and honest capability limits
+
+What is not here yet:
+
+- SSH tunnel lifecycle management is not implemented yet.
+- Connection testing is direct-only today; no tunnel bring-up/tear-down happens behind the scenes.
 
 The next document to read should be:
 

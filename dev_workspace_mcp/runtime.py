@@ -10,6 +10,8 @@ from dev_workspace_mcp.commands.service import CommandService
 from dev_workspace_mcp.config import Settings, get_settings
 from dev_workspace_mcp.http_tools.local_client import LocalHttpClient
 from dev_workspace_mcp.probes.service import ProbeService
+from dev_workspace_mcp.projects.bootstrap import ProjectBootstrapService
+from dev_workspace_mcp.projects.connections import ProjectConnectionService
 from dev_workspace_mcp.projects.registry import ProjectRegistry
 from dev_workspace_mcp.services.manager import ServiceManager
 
@@ -21,6 +23,8 @@ class RuntimeServices:
     probe_service: ProbeService
     codegraph_service: CodegraphService
     http_client: LocalHttpClient
+    bootstrap_service: ProjectBootstrapService
+    connection_service: ProjectConnectionService
 
 
 @dataclass(slots=True)
@@ -55,12 +59,16 @@ def create_runtime_services(project_registry: ProjectRegistry) -> RuntimeService
         provider=provider,
     )
     http_client = LocalHttpClient()
+    bootstrap_service = ProjectBootstrapService(project_registry)
+    connection_service = ProjectConnectionService(project_registry)
     return RuntimeServices(
         command_service=command_service,
         service_manager=service_manager,
         probe_service=probe_service,
         codegraph_service=codegraph_service,
         http_client=http_client,
+        bootstrap_service=bootstrap_service,
+        connection_service=connection_service,
     )
 
 

@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from dev_workspace_mcp.models.connections import ConnectionProfile
 from dev_workspace_mcp.policy.models import EffectivePolicySummary, ProjectPolicy
 
 
@@ -41,6 +42,7 @@ class ProjectManifest(BaseModel):
     services: dict[str, ServiceDefinition] = Field(default_factory=dict)
     probes: dict[str, ProbeDefinition] = Field(default_factory=dict)
     presets: dict[str, list[str]] = Field(default_factory=dict)
+    connections: dict[str, ConnectionProfile] = Field(default_factory=dict)
 
 
 class ProjectRecord(BaseModel):

@@ -30,6 +30,10 @@ class ErrorCode(StrEnum):
     GIT_NOT_AVAILABLE = "GIT_NOT_AVAILABLE"
     GIT_OPERATION_FAILED = "GIT_OPERATION_FAILED"
     HTTP_REQUEST_FAILED = "HTTP_REQUEST_FAILED"
+    BOOTSTRAP_FAILED = "BOOTSTRAP_FAILED"
+    CONNECTION_NOT_FOUND = "CONNECTION_NOT_FOUND"
+    CONNECTION_TEST_FAILED = "CONNECTION_TEST_FAILED"
+    ENV_FILE_INVALID = "ENV_FILE_INVALID"
     STATE_DOC_NOT_FOUND = "STATE_DOC_NOT_FOUND"
     STATE_DOC_LIMIT_EXCEEDED = "STATE_DOC_LIMIT_EXCEEDED"
     WATCHER_UNAVAILABLE = "WATCHER_UNAVAILABLE"
@@ -46,7 +50,14 @@ class ValidationIssue(BaseModel):
 class ErrorDescriptor(BaseModel):
     code: ErrorCode
     category: Literal[
-        "projects", "files", "commands", "services", "git", "state_docs", "internal"
+        "projects",
+        "connections",
+        "files",
+        "commands",
+        "services",
+        "git",
+        "state_docs",
+        "internal",
     ] = "internal"
     retryable: bool = False
     default_message: str | None = None
