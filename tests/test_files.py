@@ -102,3 +102,173 @@ def test_file_tools_reject_path_traversal(workspace_root, make_manifest_project)
 
     assert result["ok"] is False
     assert result["error"]["code"] == "INVALID_PATH"
+
+
+def test_read_file_denies_symlink_to_file_outside_project(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    outside_file = workspace_root / "outside.txt"
+    outside_file.write_text("secret\n", encoding="utf-8")
+    (project_root / "escape.txt").symlink_to(outside_file)
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+
+    result = tools.run("read_file", project_id="manifest-id", path="escape.txt")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PATH_OUTSIDE_PROJECT"
+
+
+def test_list_dir_denies_symlink_to_directory_outside_project(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    outside_dir = workspace_root / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "secret.txt").write_text("secret\n", encoding="utf-8")
+    (project_root / "linked").symlink_to(outside_dir, target_is_directory=True)
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+
+    result = tools.run("list_dir", project_id="manifest-id", path="linked")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PATH_OUTSIDE_PROJECT"
+
+
+def test_write_file_denies_symlink_traversal_by_default(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    outside_dir = workspace_root / "outside-write-dir"
+    outside_dir.mkdir()
+    (project_root / "linked").symlink_to(outside_dir, target_is_directory=True)
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+
+    result = tools.run(
+        "write_file",
+        project_id="manifest-id",
+        path="linked/new.txt",
+        content="should not write\n",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PATH_SYMLINK_DENIED"
+    assert not (outside_dir / "new.txt").exists()
+
+
+def test_write_file_allows_missing_leaf_under_in_project_parent(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    (project_root / "src").mkdir()
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+
+    result = tools.run(
+        "write_file",
+        project_id="manifest-id",
+        path="src/generated.py",
+        content="print('ok')\n",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["path"] == "src/generated.py"
+    assert (project_root / "src" / "generated.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+
+def test_apply_patch_denies_symlink_source_escape(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    outside_file = workspace_root / "outside-patch.txt"
+    outside_file.write_text("secret\n", encoding="utf-8")
+    (project_root / "escape.txt").symlink_to(outside_file)
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+
+    result = tools.run(
+        "apply_patch",
+        project_id="manifest-id",
+        patch=(
+            "--- a/escape.txt\n"
+            "+++ b/escape.txt\n"
+            "@@ -1 +1 @@\n"
+            "-secret\n"
+            "+mutated\n"
+        ),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PATH_SYMLINK_DENIED"
+    assert outside_file.read_text(encoding="utf-8") == "secret\n"
+
+
+
+def test_move_path_denies_symlink_source_escape(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    outside_file = workspace_root / "outside-move.txt"
+    outside_file.write_text("secret\n", encoding="utf-8")
+    (project_root / "escape.txt").symlink_to(outside_file)
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+
+    result = tools.run(
+        "move_path",
+        project_id="manifest-id",
+        source_path="escape.txt",
+        destination_path="src/renamed.txt",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PATH_SYMLINK_DENIED"
+    assert outside_file.exists()
+    assert (project_root / "escape.txt").is_symlink()
+
+
+
+def test_delete_path_denies_symlink_source_escape(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    outside_file = workspace_root / "outside-delete.txt"
+    outside_file.write_text("secret\n", encoding="utf-8")
+    (project_root / "escape.txt").symlink_to(outside_file)
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+
+    result = tools.run(
+        "delete_path",
+        project_id="manifest-id",
+        path="escape.txt",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PATH_SYMLINK_DENIED"
+    assert outside_file.exists()
+    assert (project_root / "escape.txt").is_symlink()

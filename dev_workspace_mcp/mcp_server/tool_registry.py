@@ -5,21 +5,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dev_workspace_mcp.codegraph.index_manager import CodegraphIndexManager
-from dev_workspace_mcp.codegraph.providers import build_codegraph_provider
 from dev_workspace_mcp.codegraph.service import CodegraphService
-from dev_workspace_mcp.codegraph.watcher_manager import CodegraphWatcherManager
 from dev_workspace_mcp.commands.service import CommandService
 from dev_workspace_mcp.files.service import FileService
 from dev_workspace_mcp.gittools.service import GitService
 from dev_workspace_mcp.http_tools.local_client import LocalHttpClient
 from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.mcp_server.result_envelope import error_result, ok
+from dev_workspace_mcp.models.common import WarningMessage
 from dev_workspace_mcp.models.errors import ErrorCode
 from dev_workspace_mcp.models.projects import WatcherSummary
 from dev_workspace_mcp.models.state_docs import StateDocKind
-from dev_workspace_mcp.probes.service import ProbeService
 from dev_workspace_mcp.projects.snapshots import build_project_snapshot
+from dev_workspace_mcp.runtime import RuntimeServices, create_runtime_services
 from dev_workspace_mcp.services.manager import ServiceManager
 from dev_workspace_mcp.state_docs.service import StateDocumentService
 
@@ -66,30 +64,18 @@ class ToolRegistry:
 
 
 
-def build_tool_registry(project_registry) -> ToolRegistry:
+def build_tool_registry(
+    project_registry,
+    *,
+    services: RuntimeServices | None = None,
+) -> ToolRegistry:
     registry = ToolRegistry()
-    command_service = CommandService(
-        project_registry,
-        enforce_allowlist=getattr(project_registry.settings, "command_policy", "allowlist")
-        == "allowlist",
-    )
-    service_manager = ServiceManager(project_registry)
-    probe_service = ProbeService(
-        project_registry,
-        enforce_allowlist=getattr(project_registry.settings, "command_policy", "allowlist")
-        == "allowlist",
-    )
-    provider = build_codegraph_provider(
-        max_matches=getattr(project_registry.settings, "codegraph_max_matches", 200),
-        max_source_chars=getattr(project_registry.settings, "codegraph_max_source_chars", 20_000),
-    )
-    codegraph_service = CodegraphService(
-        project_registry=project_registry,
-        watcher_manager=CodegraphWatcherManager(),
-        index_manager=CodegraphIndexManager(),
-        provider=provider,
-    )
-    http_client = LocalHttpClient()
+    runtime_services = services or create_runtime_services(project_registry)
+    command_service = runtime_services.command_service
+    service_manager = runtime_services.service_manager
+    probe_service = runtime_services.probe_service
+    codegraph_service = runtime_services.codegraph_service
+    http_client = runtime_services.http_client
 
     registry.register(
         ToolDefinition(
@@ -329,6 +315,7 @@ def build_tool_registry(project_registry) -> ToolRegistry:
             handler=lambda project_id: _project_snapshot_handler(
                 project_registry,
                 codegraph_service,
+                service_manager,
                 project_id,
             ),
         )
@@ -480,20 +467,37 @@ def build_tool_registry(project_registry) -> ToolRegistry:
 def _project_snapshot_handler(
     project_registry,
     codegraph_service: CodegraphService,
+    service_manager: ServiceManager,
     project_id: str,
 ) -> dict[str, Any]:
-    snapshot, warnings = build_project_snapshot(project_registry, project_id)
-    watcher = codegraph_service.watcher_health(project_id)
-    snapshot.watcher = WatcherSummary(
-        configured=watcher.configured,
-        active=watcher.active,
-        watched_paths=watcher.watched_paths,
-        status=watcher.status,
-        revision=watcher.revision,
-        indexed_at=watcher.indexed_at,
-        file_count=watcher.file_count,
-        symbol_count=watcher.symbol_count,
+    snapshot, warnings = build_project_snapshot(
+        project_registry,
+        project_id,
+        service_manager=service_manager,
     )
+    try:
+        watcher = codegraph_service.watcher_health(project_id)
+    except Exception:
+        warnings.append(
+            WarningMessage(
+                code="WATCHER_STATUS_UNAVAILABLE",
+                message=(
+                    "Watcher health could not be refreshed cleanly; "
+                    "returning the declared snapshot view."
+                ),
+            )
+        )
+    else:
+        snapshot.watcher = WatcherSummary(
+            configured=watcher.configured,
+            active=watcher.active,
+            watched_paths=watcher.watched_paths,
+            status=watcher.status,
+            revision=watcher.revision,
+            indexed_at=watcher.indexed_at,
+            file_count=watcher.file_count,
+            symbol_count=watcher.symbol_count,
+        )
     return ok(snapshot, warnings=warnings)
 
 
@@ -508,13 +512,14 @@ def _http_request(
     body: str | bytes | None,
     timeout_sec: int,
 ):
-    project_registry.require(project_id)
+    project = project_registry.require(project_id)
     return http_client.request(
         method=method,
         url=url,
         headers=headers,
         body=body,
         timeout_sec=timeout_sec,
+        network_policy=project.policy.network,
     )
 
 

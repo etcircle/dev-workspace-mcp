@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from dev_workspace_mcp.policy.models import EffectivePolicySummary, ProjectPolicy
+
 
 class ServiceHealthCheckDefinition(BaseModel):
     type: Literal["http", "command", "none"] = "none"
@@ -48,6 +50,7 @@ class ProjectRecord(BaseModel):
     manifest_path: str | None = None
     aliases: list[str] = Field(default_factory=list)
     manifest: ProjectManifest = Field(default_factory=ProjectManifest)
+    policy: ProjectPolicy = Field(default_factory=ProjectPolicy)
 
 
 class ProjectListItem(BaseModel):
@@ -65,6 +68,10 @@ class ServiceSummary(BaseModel):
     cwd: str
     ports: list[int] = Field(default_factory=list)
     has_health_check: bool = False
+    status: Literal["stopped", "starting", "running", "degraded", "failed", "unknown"] = "unknown"
+    health_status: Literal["healthy", "unhealthy", "unknown"] = "unknown"
+    health_message: str | None = None
+    start_command: list[str] = Field(default_factory=list)
 
 
 class GitSummary(BaseModel):
@@ -93,6 +100,24 @@ class StateDocSummary(BaseModel):
     path: str
     exists: bool = False
     char_count: int = 0
+    section_headings: list[str] = Field(default_factory=list)
+    preview_lines: list[str] = Field(default_factory=list)
+
+
+class ProjectStackSummary(BaseModel):
+    languages: list[str] = Field(default_factory=list)
+    frameworks: list[str] = Field(default_factory=list)
+    package_managers: list[str] = Field(default_factory=list)
+
+
+class CapabilitySummary(BaseModel):
+    code_navigation: str = ""
+    watcher: str = ""
+    services: str = ""
+    state_docs: str = ""
+    commands: str = ""
+    search: str = ""
+    github: str = ""
 
 
 class ProjectSnapshot(BaseModel):
@@ -104,9 +129,18 @@ class ProjectSnapshot(BaseModel):
     probes: list[str] = Field(default_factory=list)
     presets: list[str] = Field(default_factory=list)
     state_docs: list[StateDocSummary] = Field(default_factory=list)
+    policy: EffectivePolicySummary = Field(default_factory=EffectivePolicySummary)
+    stack: ProjectStackSummary = Field(default_factory=ProjectStackSummary)
+    agents_summary: list[str] = Field(default_factory=list)
+    memory_summary: list[str] = Field(default_factory=list)
+    active_tasks: list[str] = Field(default_factory=list)
+    recommended_commands: list[str] = Field(default_factory=list)
+    recommended_next_tools: list[str] = Field(default_factory=list)
+    capabilities: CapabilitySummary = Field(default_factory=CapabilitySummary)
 
 
 __all__ = [
+    "CapabilitySummary",
     "CodegraphConfig",
     "GitSummary",
     "ProbeDefinition",
@@ -114,6 +148,7 @@ __all__ = [
     "ProjectManifest",
     "ProjectRecord",
     "ProjectSnapshot",
+    "ProjectStackSummary",
     "ServiceDefinition",
     "ServiceHealthCheckDefinition",
     "ServiceSummary",

@@ -4,8 +4,7 @@ import hashlib
 from pathlib import Path
 
 from dev_workspace_mcp.codegraph.models import CodegraphIndexSnapshot
-from dev_workspace_mcp.files.validation import validate_relative_path
-from dev_workspace_mcp.shared.paths import resolve_relative_path, to_relative_display
+from dev_workspace_mcp.shared.paths import resolve_project_path, to_relative_display
 
 _IGNORED_DIRS = {
     ".git",
@@ -47,11 +46,10 @@ class CodegraphIndexManager:
         digest = hashlib.sha256()
         normalized_paths = list(watched_paths or ["."])
         for relative_path in normalized_paths:
-            normalized = validate_relative_path(relative_path)
-            resolved = resolve_relative_path(project_root, normalized).resolve()
-            digest.update(normalized.encode("utf-8"))
+            resolved = resolve_project_path(project_root, relative_path)
+            digest.update(relative_path.encode("utf-8"))
             digest.update(str(resolved.exists()).encode("utf-8"))
-            for file_path in self._iter_candidate_files(project_root, normalized):
+            for file_path in self._iter_candidate_files(project_root, relative_path):
                 relative_display = to_relative_display(file_path, project_root)
                 stat = file_path.stat()
                 digest.update(relative_display.encode("utf-8"))
@@ -60,7 +58,7 @@ class CodegraphIndexManager:
         return digest.hexdigest()[:16]
 
     def _iter_candidate_files(self, project_root: Path, relative_path: str):
-        root = resolve_relative_path(project_root, relative_path).resolve()
+        root = resolve_project_path(project_root, relative_path)
         if not root.exists():
             return
         if root.is_file():
@@ -69,8 +67,9 @@ class CodegraphIndexManager:
         for file_path in root.rglob("*"):
             if any(part in _IGNORED_DIRS for part in file_path.parts):
                 continue
-            if file_path.is_file():
-                yield file_path
+            if not file_path.is_file():
+                continue
+            yield resolve_project_path(project_root, str(file_path.relative_to(project_root)))
 
 
 __all__ = ["CodegraphIndexManager"]

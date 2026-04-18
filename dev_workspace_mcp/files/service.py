@@ -5,7 +5,6 @@ from hashlib import sha256
 from pathlib import Path
 
 from dev_workspace_mcp.files.patching import apply_unified_diff_to_text, parse_unified_diff
-from dev_workspace_mcp.files.validation import validate_relative_path
 from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.models.errors import ErrorCode
 from dev_workspace_mcp.models.files import (
@@ -17,7 +16,7 @@ from dev_workspace_mcp.models.files import (
     ReadFileResponse,
     WriteFileResponse,
 )
-from dev_workspace_mcp.shared.paths import resolve_relative_path, to_relative_display
+from dev_workspace_mcp.shared.paths import resolve_project_path, to_relative_display
 
 
 class FileService:
@@ -27,9 +26,19 @@ class FileService:
         self.project_root = Path(project_root).resolve()
         self.max_read_bytes = max_read_bytes
 
-    def resolve_path(self, relative_path: str) -> Path:
-        normalized = validate_relative_path(relative_path)
-        return resolve_relative_path(self.project_root, normalized).resolve()
+    def resolve_path(
+        self,
+        relative_path: str,
+        *,
+        allow_missing_leaf: bool = False,
+        forbid_symlinks: bool = False,
+    ) -> Path:
+        return resolve_project_path(
+            self.project_root,
+            relative_path,
+            allow_missing_leaf=allow_missing_leaf,
+            forbid_symlinks=forbid_symlinks,
+        )
 
     def list_dir(
         self,
@@ -119,7 +128,11 @@ class FileService:
         create_parents: bool = True,
         overwrite: bool = True,
     ) -> WriteFileResponse:
-        path = self.resolve_path(relative_path)
+        path = self.resolve_path(
+            relative_path,
+            allow_missing_leaf=True,
+            forbid_symlinks=True,
+        )
         if path.exists() and not overwrite:
             raise DomainError(
                 code=ErrorCode.INVALID_PATH,
@@ -161,12 +174,16 @@ class FileService:
                 changed_paths.append(file_patch.old_path)
                 continue
 
-            destination = self.resolve_path(file_patch.new_path)
+            destination = self.resolve_path(
+                file_patch.new_path,
+                allow_missing_leaf=True,
+                forbid_symlinks=True,
+            )
             if file_patch.old_path is None:
                 original_text = ""
                 destination.parent.mkdir(parents=True, exist_ok=True)
             else:
-                source = self.resolve_path(file_patch.old_path)
+                source = self.resolve_path(file_patch.old_path, forbid_symlinks=True)
                 if not source.exists() or not source.is_file():
                     raise DomainError(
                         code=ErrorCode.PATH_NOT_FOUND,
@@ -191,8 +208,12 @@ class FileService:
         *,
         overwrite: bool = False,
     ) -> PathMutationResponse:
-        source = self.resolve_path(source_path)
-        destination = self.resolve_path(destination_path)
+        source = self.resolve_path(source_path, forbid_symlinks=True)
+        destination = self.resolve_path(
+            destination_path,
+            allow_missing_leaf=True,
+            forbid_symlinks=True,
+        )
         if not source.exists():
             raise DomainError(
                 code=ErrorCode.PATH_NOT_FOUND,
@@ -228,7 +249,7 @@ class FileService:
         recursive: bool = False,
         missing_ok: bool = False,
     ) -> PathMutationResponse:
-        path = self.resolve_path(relative_path)
+        path = self.resolve_path(relative_path, forbid_symlinks=True)
         existed = path.exists()
         if not existed:
             if not missing_ok:

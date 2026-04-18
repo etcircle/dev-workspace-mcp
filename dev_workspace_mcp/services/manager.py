@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from dev_workspace_mcp.commands.allowlist import evaluate_command_policy
 from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.models.errors import ErrorCode
-from dev_workspace_mcp.models.projects import ServiceDefinition
+from dev_workspace_mcp.models.projects import ProjectRecord, ServiceDefinition
 from dev_workspace_mcp.models.services import (
     GetLogsResponse,
     ListServicesResponse,
@@ -18,10 +20,13 @@ from dev_workspace_mcp.models.services import (
     ServiceRuntimeState,
     ServiceStatusResponse,
 )
+from dev_workspace_mcp.policy.env import build_subprocess_env
 from dev_workspace_mcp.projects.registry import ProjectRegistry
 from dev_workspace_mcp.services.health import ServiceHealthChecker
 from dev_workspace_mcp.services.logs import ServiceLogStore
 from dev_workspace_mcp.services.process_store import InMemoryProcessStore
+from dev_workspace_mcp.shared.paths import resolve_project_path
+from dev_workspace_mcp.shared.security import redact_secrets
 
 
 class ServiceManager:
@@ -43,7 +48,7 @@ class ServiceManager:
     def list_services(self, project_id: str) -> ListServicesResponse:
         project = self.project_registry.require(project_id)
         services = [
-            self._current_record(project_id, name, definition)
+            self._current_record(project.project_id, name, definition)
             for name, definition in sorted(project.manifest.services.items())
         ]
         return ListServicesResponse(services=services)
@@ -51,7 +56,7 @@ class ServiceManager:
     def service_status(self, project_id: str, service_name: str) -> ServiceStatusResponse:
         project, definition = self._project_and_definition(project_id, service_name)
         record = self._current_record(project_id, service_name, definition)
-        record = self._apply_health(project.root_path, definition, record)
+        record = self._apply_health(project, definition, record)
         self.process_store.save(self._service_key(project_id, service_name), record)
         return ServiceStatusResponse(service=record)
 
@@ -61,7 +66,7 @@ class ServiceManager:
         current = self._current_record(project_id, service_name, definition)
         active = self.process_store.get_process(key)
         if active is not None and active.process.poll() is None:
-            record = self._apply_health(project.root_path, definition, current)
+            record = self._apply_health(project, definition, current)
             return ServiceActionResponse(service=record)
 
         if not definition.start:
@@ -70,10 +75,12 @@ class ServiceManager:
                 message=f"Service '{service_name}' does not define a start command.",
             )
 
+        self._ensure_command_allowed(project, definition.start, service_name=service_name)
         cwd = self._resolve_service_cwd(Path(project.root_path), definition)
         process = subprocess.Popen(
             definition.start,
             cwd=str(cwd),
+            env=build_subprocess_env(os.environ, project.policy.env),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -92,17 +99,17 @@ class ServiceManager:
             deep=True,
         )
         record = current.model_copy(update={"runtime": runtime}, deep=True)
-        record = self._apply_health(project.root_path, definition, record)
+        record = self._apply_health(project, definition, record)
         record = self.process_store.save(key, record)
 
         stdout_thread = threading.Thread(
             target=self._capture_stream,
-            args=(key, "stdout", process.stdout),
+            args=(key, "stdout", process.stdout, project.policy.env),
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=self._capture_stream,
-            args=(key, "stderr", process.stderr),
+            args=(key, "stderr", process.stderr, project.policy.env),
             daemon=True,
         )
         stdout_thread.start()
@@ -145,7 +152,7 @@ class ServiceManager:
             deep=True,
         )
         record = current.model_copy(update={"runtime": runtime}, deep=True)
-        record = self._apply_health(project.root_path, definition, record)
+        record = self._apply_health(project, definition, record)
         self.process_store.save(key, record)
         self.process_store.pop_process(key)
         return ServiceActionResponse(service=record)
@@ -214,7 +221,8 @@ class ServiceManager:
                 self.process_store.pop_process(key)
             return current
 
-        project_root = Path(self.project_registry.require(project_id).root_path)
+        project = self.project_registry.require(project_id)
+        project_root = Path(project.root_path)
         cwd = self._resolve_service_cwd(project_root, definition)
         return ServiceRecord(
             project_id=project_id,
@@ -230,20 +238,26 @@ class ServiceManager:
 
     def _apply_health(
         self,
-        project_root: str,
+        project: ProjectRecord,
         definition: ServiceDefinition,
         record: ServiceRecord,
     ) -> ServiceRecord:
-        health = self.health_checker.check(definition, record, project_root=Path(project_root))
+        health = self.health_checker.check(
+            definition,
+            record,
+            project_root=Path(project.root_path),
+            policy=project.policy,
+        )
         runtime = record.runtime.model_copy(update={"health": health}, deep=True)
         return record.model_copy(update={"runtime": runtime}, deep=True)
 
-    def _capture_stream(self, key: str, stream: str, handle) -> None:
+    def _capture_stream(self, key: str, stream: str, handle, env_policy) -> None:
         if handle is None:
             return
         try:
             for line in iter(handle.readline, ""):
-                self.log_store.append(key, stream, line.rstrip("\n"))
+                message = redact_secrets(line.rstrip("\n"), env_policy=env_policy)
+                self.log_store.append(key, stream, message)
         finally:
             handle.close()
 
@@ -277,19 +291,35 @@ class ServiceManager:
             deep=True,
         )
         record = current.model_copy(update={"runtime": runtime}, deep=True)
-        project_root = self.project_registry.require(project_id).root_path
-        record = self._apply_health(project_root, definition, record)
+        project = self.project_registry.require(project_id)
+        record = self._apply_health(project, definition, record)
         self.process_store.save(key, record)
         self.process_store.pop_process(key)
 
     def _resolve_service_cwd(self, project_root: Path, definition: ServiceDefinition) -> Path:
-        cwd = (project_root / definition.cwd).resolve()
+        cwd = resolve_project_path(project_root, definition.cwd)
         if not cwd.exists() or not cwd.is_dir():
             raise DomainError(
                 code=ErrorCode.PATH_NOT_FOUND,
                 message=f"Service cwd does not exist: {definition.cwd}",
             )
         return cwd
+
+    def _ensure_command_allowed(
+        self,
+        project: ProjectRecord,
+        argv: list[str],
+        *,
+        service_name: str,
+    ) -> None:
+        decision = evaluate_command_policy(project.policy, argv)
+        if not decision.allowed:
+            raise DomainError(
+                code=ErrorCode.POLICY_DENIED,
+                message=f"Service '{service_name}' start blocked. {decision.message}",
+                hint=decision.hint,
+                details={"argv": list(argv), "service_name": service_name},
+            )
 
     @staticmethod
     def _service_key(project_id: str, service_name: str) -> str:

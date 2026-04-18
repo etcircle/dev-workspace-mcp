@@ -31,7 +31,11 @@ The goal is a smooth end-to-end agent loop:
 
 ### 1. Standard MCP, not a new protocol
 
-This is a normal MCP server, exposed over native Streamable HTTP.
+This is a normal MCP server with:
+
+- native Streamable HTTP transport
+- native stdio transport
+- an in-process JSON-first CLI that hits the same runtime/service layer
 
 ### 2. `project_id` is mandatory
 
@@ -270,13 +274,31 @@ Recommended max size: 8,000 chars.
 python -m pip install -e '.[dev]'
 python -m dev_workspace_mcp.app describe
 python -m dev_workspace_mcp.app serve-http --host 127.0.0.1 --port 8081 --path /mcp
+# or
+python -m dev_workspace_mcp.app stdio
+# or
+python -m dev_workspace_mcp.app cli projects
 ```
 
-The native MCP endpoint is then available at:
+The native MCP HTTP endpoint is then available at:
 
 ```text
 http://127.0.0.1:8081/mcp
 ```
+
+CLI notes:
+
+- `dev-workspace-mcp cli` returns the same stable JSON result envelope as the MCP tools.
+- output is compact JSON by default
+- `--json` pretty-prints the same envelope for humans
+- current CLI parity slice is intentionally small and honest:
+  - `projects`
+  - `snapshot <project_id>`
+  - `read <project_id> <path>`
+  - `run <project_id> -- ...`
+  - `git status <project_id>`
+  - `memory read <project_id>`
+  - `memory patch <project_id> --section ...`
 
 ## Manifest example
 
@@ -343,8 +365,8 @@ Required safeguards:
 Example error codes:
 
 - `PROJECT_NOT_FOUND`
-- `INVALID_RELATIVE_PATH`
-- `SERVICE_NOT_DECLARED`
+- `INVALID_PATH`
+- `SERVICE_NOT_FOUND`
 - `JOB_NOT_FOUND`
 - `STATE_DOC_LIMIT_EXCEEDED`
 - `COMMAND_NOT_ALLOWED`
@@ -356,8 +378,8 @@ For most debugging and implementation tasks, the model should start here:
 
 1. `list_projects`
 2. `project_snapshot(project_id=...)`
-3. `service_status(project_id=..., service=...)`
-4. `get_logs(project_id=..., service=...)`
+3. `service_status(project_id=..., service_name=...)`
+4. `get_logs(project_id=..., service_name=...)`
 5. semantic code tools like `grep`, `module_overview`, `function_context`
 6. `apply_patch` or `write_file`
 7. `run_command`
@@ -367,7 +389,38 @@ For most debugging and implementation tasks, the model should start here:
 
 If `project_snapshot` is good, the entire agent experience gets dramatically better.
 
-## Build order
+## `project_snapshot` boot packet
+
+`project_snapshot` is no longer just a light project summary. It is meant to be the agent's boot packet.
+
+Current fields include:
+
+- project record and git summary
+- policy summary
+- declared services with runtime status, health summary, ports, and start command
+- watcher/index summary
+- recent changed files
+- probes and presets
+- state-doc existence plus short previews
+- stack summary:
+  - `languages`
+  - `frameworks`
+  - `package_managers`
+- repo guidance summary from `AGENTS.md`
+- short memory summary from `.devworkspace/memory.md`
+- active task summary from `.devworkspace/tasks.md`
+- recommended commands
+- recommended next tools
+- explicit capability summary
+
+Honesty rules matter here:
+
+- watcher metadata may be snapshot-backed even when there is no real filesystem watcher backend yet
+- grep + in-memory codegraph snapshots are useful, but they are not a persistent search service
+- GitHub helpers should not be implied if the repo only exposes local git tools today
+- if git status, watcher refresh, or state-doc reads fail, snapshot should degrade with warnings instead of lying or crashing
+
+## Historical build order
 
 ### Phase 1
 - create repo skeleton
@@ -413,17 +466,21 @@ The job is much simpler: be an excellent remote development workspace MCP server
 
 This repository now has a working local implementation of:
 
-- project discovery and snapshots
+- project discovery, alias resolution, and richer project snapshots
+- policy-aware path safety, environment filtering, and local-network restrictions
 - first semantic code tools (`module_overview`, `function_context`, `grep`, `find_references`, `read_source`, `recent_changes`, `call_path`, `watcher_health`)
 - an in-process codegraph boundary that keeps the public MCP contract stable while we port useful CodeGraph logic directly into this repo
 - safe file tools
 - state-doc tools
 - bounded commands and jobs
-- service lifecycle and logs
+- service lifecycle, logs, and health checks
 - git tools
 - local HTTP verification
 - manifest-declared probes
 - native Streamable HTTP MCP transport wiring
+- native stdio MCP transport wiring
+- a small in-process JSON-first CLI parity slice
+- a `project_snapshot` boot packet that summarizes stack, repo guidance, memory, active tasks, services, and honest capability limits
 
 The next document to read should be:
 

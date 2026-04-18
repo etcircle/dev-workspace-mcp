@@ -7,7 +7,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from dev_workspace_mcp.commands.allowlist import CommandAllowlist
+from dev_workspace_mcp.commands.allowlist import (
+    CommandAllowlist,
+    CommandPolicyDecision,
+    evaluate_command_policy,
+)
 from dev_workspace_mcp.commands.jobs import InMemoryJobStore
 from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.models.commands import (
@@ -18,8 +22,12 @@ from dev_workspace_mcp.models.commands import (
     RunCommandResponse,
 )
 from dev_workspace_mcp.models.errors import ErrorCode
+from dev_workspace_mcp.models.projects import ProjectRecord
+from dev_workspace_mcp.policy.env import build_subprocess_env
+from dev_workspace_mcp.policy.models import CommandRule, EnvPolicy
 from dev_workspace_mcp.projects.registry import ProjectRegistry
-from dev_workspace_mcp.shared.paths import resolve_relative_path
+from dev_workspace_mcp.shared.paths import resolve_project_path
+from dev_workspace_mcp.shared.security import redact_secrets
 from dev_workspace_mcp.shared.subprocess import coerce_argv
 
 
@@ -53,11 +61,12 @@ class CommandService:
         preset: str | None = None,
     ) -> RunCommandResponse:
         project = self.project_registry.require(project_id)
-        resolved_argv = self._resolve_argv(project_id, preset=preset, argv=argv or [])
-        self._ensure_allowed(resolved_argv)
+        resolved_argv = self._resolve_argv(project, preset=preset, argv=argv or [])
+        decision = self._ensure_allowed(project, resolved_argv)
         resolved_cwd = self._resolve_cwd(Path(project.root_path), cwd)
         started_at = datetime.now(UTC)
-        timeout = timeout_sec or self.default_timeout_sec
+        timeout = self._effective_timeout(timeout_sec, decision.rule)
+        subprocess_env = build_subprocess_env(os.environ, project.policy.env, overrides=env or {})
 
         job = JobRecord(
             job_id=str(uuid4()),
@@ -72,10 +81,24 @@ class CommandService:
 
         if background:
             return RunCommandResponse(
-                job=self._start_background_job(job, resolved_cwd, env or {}, timeout),
+                job=self._start_background_job(
+                    job,
+                    resolved_cwd,
+                    subprocess_env,
+                    timeout,
+                    env_policy=project.policy.env,
+                    max_output_bytes=_max_output_bytes(decision.rule),
+                ),
             )
         return RunCommandResponse(
-            job=self._run_foreground_job(job, resolved_cwd, env or {}, timeout),
+            job=self._run_foreground_job(
+                job,
+                resolved_cwd,
+                subprocess_env,
+                timeout,
+                env_policy=project.policy.env,
+                max_output_bytes=_max_output_bytes(decision.rule),
+            ),
         )
 
     def get_job(self, project_id: str, job_id: str) -> GetJobResponse:
@@ -104,7 +127,13 @@ class CommandService:
         )
         return CancelJobResponse(job=cancelled)
 
-    def _resolve_argv(self, project_id: str, *, preset: str | None, argv: list[str]) -> list[str]:
+    def _resolve_argv(
+        self,
+        project: ProjectRecord,
+        *,
+        preset: str | None,
+        argv: list[str],
+    ) -> list[str]:
         if preset and argv:
             raise DomainError(
                 code=ErrorCode.VALIDATION_ERROR,
@@ -113,7 +142,6 @@ class CommandService:
 
         resolved_argv = coerce_argv(argv)
         if preset:
-            project = self.project_registry.require(project_id)
             if preset not in project.manifest.presets:
                 raise DomainError(
                     code=ErrorCode.VALIDATION_ERROR,
@@ -129,7 +157,7 @@ class CommandService:
             )
         return resolved_argv
 
-    def _ensure_allowed(self, argv: list[str]) -> None:
+    def _ensure_allowed(self, project: ProjectRecord, argv: list[str]) -> CommandPolicyDecision:
         if self.enforce_allowlist and not self.allowlist.is_allowed(argv):
             raise DomainError(
                 code=ErrorCode.COMMAND_NOT_ALLOWED,
@@ -137,10 +165,20 @@ class CommandService:
                 hint=self.allowlist.explain(argv),
             )
 
+        decision = evaluate_command_policy(project.policy, argv)
+        if not decision.allowed:
+            raise DomainError(
+                code=ErrorCode.POLICY_DENIED,
+                message=decision.message,
+                hint=decision.hint,
+                details={"argv": list(argv)},
+            )
+        return decision
+
     def _resolve_cwd(self, project_root: Path, cwd: str | None) -> Path:
         if cwd in {None, "", "."}:
             return project_root
-        resolved = resolve_relative_path(project_root, cwd).resolve()
+        resolved = resolve_project_path(project_root, cwd)
         if not resolved.exists() or not resolved.is_dir():
             raise DomainError(
                 code=ErrorCode.PATH_NOT_FOUND,
@@ -154,21 +192,22 @@ class CommandService:
         cwd: Path,
         env: dict[str, str],
         timeout: int,
+        *,
+        env_policy: EnvPolicy,
+        max_output_bytes: int | None,
     ) -> JobRecord:
         try:
             result = subprocess.run(
                 job.argv,
                 cwd=str(cwd),
-                env=_merged_env(env),
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
                 check=False,
             )
-            if result.stdout:
-                self.job_store.append_output(job.job_id, "stdout", result.stdout)
-            if result.stderr:
-                self.job_store.append_output(job.job_id, "stderr", result.stderr)
+            self._store_output(job.job_id, "stdout", result.stdout, env_policy, max_output_bytes)
+            self._store_output(job.job_id, "stderr", result.stderr, env_policy, max_output_bytes)
             return self.job_store.update(
                 job.job_id,
                 status="succeeded" if result.returncode == 0 else "failed",
@@ -176,10 +215,8 @@ class CommandService:
                 timing=_finish_timing(job.timing),
             )
         except subprocess.TimeoutExpired as exc:
-            if exc.stdout:
-                self.job_store.append_output(job.job_id, "stdout", exc.stdout)
-            if exc.stderr:
-                self.job_store.append_output(job.job_id, "stderr", exc.stderr)
+            self._store_output(job.job_id, "stdout", exc.stdout, env_policy, max_output_bytes)
+            self._store_output(job.job_id, "stderr", exc.stderr, env_policy, max_output_bytes)
             return self.job_store.update(
                 job.job_id,
                 status="timed_out",
@@ -192,11 +229,14 @@ class CommandService:
         cwd: Path,
         env: dict[str, str],
         timeout: int,
+        *,
+        env_policy: EnvPolicy,
+        max_output_bytes: int | None,
     ) -> JobRecord:
         process = subprocess.Popen(
             job.argv,
             cwd=str(cwd),
-            env=_merged_env(env),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -205,12 +245,12 @@ class CommandService:
 
         stdout_thread = threading.Thread(
             target=self._capture_stream,
-            args=(job.job_id, "stdout", process.stdout),
+            args=(job.job_id, "stdout", process.stdout, env_policy, max_output_bytes),
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=self._capture_stream,
-            args=(job.job_id, "stderr", process.stderr),
+            args=(job.job_id, "stderr", process.stderr, env_policy, max_output_bytes),
             daemon=True,
         )
         stdout_thread.start()
@@ -229,13 +269,19 @@ class CommandService:
         waiter.start()
         return current
 
-    def _capture_stream(self, job_id: str, stream: str, handle) -> None:
+    def _capture_stream(
+        self,
+        job_id: str,
+        stream: str,
+        handle,
+        env_policy: EnvPolicy,
+        max_output_bytes: int | None,
+    ) -> None:
         if handle is None:
             return
         try:
             text = handle.read()
-            if text:
-                self.job_store.append_output(job_id, stream, text)
+            self._store_output(job_id, stream, text, env_policy, max_output_bytes)
         finally:
             handle.close()
 
@@ -280,13 +326,51 @@ class CommandService:
             )
         return job
 
+    def _effective_timeout(self, timeout_sec: int | None, rule: CommandRule | None) -> int:
+        timeout = timeout_sec or self.default_timeout_sec
+        if rule is not None and rule.max_seconds is not None:
+            timeout = min(timeout, rule.max_seconds)
+        return timeout
+
+    def _store_output(
+        self,
+        job_id: str,
+        stream: str,
+        text: str | bytes | None,
+        env_policy: EnvPolicy,
+        max_output_bytes: int | None,
+    ) -> None:
+        sanitized = _sanitize_output(text, env_policy=env_policy, max_output_bytes=max_output_bytes)
+        if sanitized:
+            self.job_store.append_output(job_id, stream, sanitized)
 
 
-def _merged_env(env: dict[str, str]) -> dict[str, str]:
-    merged = os.environ.copy()
-    merged.update(env)
-    return merged
+def _sanitize_output(
+    text: str | bytes | None,
+    *,
+    env_policy: EnvPolicy,
+    max_output_bytes: int | None,
+) -> str:
+    if not text:
+        return ""
 
+    if isinstance(text, bytes):
+        normalized = text.decode("utf-8", errors="replace")
+    else:
+        normalized = text
+
+    redacted = redact_secrets(normalized, env_policy=env_policy)
+    if max_output_bytes is None:
+        return redacted
+
+    encoded = redacted.encode("utf-8")
+    if len(encoded) <= max_output_bytes:
+        return redacted
+    return encoded[:max_output_bytes].decode("utf-8", errors="ignore")
+
+
+def _max_output_bytes(rule: CommandRule | None) -> int | None:
+    return None if rule is None else rule.max_output_bytes
 
 
 def _finish_timing(timing: CommandTiming) -> CommandTiming:
@@ -298,7 +382,6 @@ def _finish_timing(timing: CommandTiming) -> CommandTiming:
             "finished_at": finished_at,
             "duration_ms": duration_ms,
         },
-        deep=True,
     )
 
 

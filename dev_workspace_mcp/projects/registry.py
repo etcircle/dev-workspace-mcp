@@ -6,6 +6,7 @@ from dev_workspace_mcp.config import Settings
 from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.models.errors import ErrorCode
 from dev_workspace_mcp.models.projects import ProjectListItem, ProjectRecord
+from dev_workspace_mcp.policy.service import load_project_policy
 from dev_workspace_mcp.projects.discovery import discover_project_roots
 from dev_workspace_mcp.projects.manifest import load_manifest, manifest_path_for
 
@@ -73,6 +74,7 @@ class ProjectRegistry:
 
     def _build_record(self, project_root: Path) -> ProjectRecord:
         manifest = load_manifest(project_root)
+        policy = load_project_policy(project_root)
         project_id = (manifest.project_id or project_root.name).strip()
         display_name = (manifest.name or project_root.name).strip()
         if not project_id:
@@ -90,6 +92,7 @@ class ProjectRegistry:
             manifest_path=str(manifest_path) if manifest_path.exists() else None,
             aliases=sorted(set(alias.strip() for alias in manifest.aliases if alias.strip())),
             manifest=manifest,
+            policy=policy,
         )
 
     def _register_project(self, projects: dict[str, ProjectRecord], record: ProjectRecord) -> None:

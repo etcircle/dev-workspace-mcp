@@ -8,7 +8,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from dev_workspace_mcp.codegraph.models import CodegraphEdge, CodegraphIndexSnapshot, CodegraphNode
-from dev_workspace_mcp.files.validation import validate_relative_path
 from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.models.codegraph import (
     CallPathNode,
@@ -23,7 +22,7 @@ from dev_workspace_mcp.models.codegraph import (
     SymbolContextMatch,
 )
 from dev_workspace_mcp.models.errors import ErrorCode
-from dev_workspace_mcp.shared.paths import resolve_relative_path, to_relative_display
+from dev_workspace_mcp.shared.paths import resolve_project_path, to_relative_display
 from dev_workspace_mcp.shared.text import truncate_text
 
 _IGNORED_DIRS = {
@@ -429,16 +428,21 @@ class InProcessCodegraphProvider:
             for file_path in root.rglob("*"):
                 if any(part in _IGNORED_DIRS for part in file_path.parts):
                     continue
-                if not file_path.is_file() or file_path in seen:
+                if not file_path.is_file():
                     continue
-                if python_only and file_path.suffix != ".py":
+                resolved_file = resolve_project_path(
+                    project_root,
+                    str(file_path.relative_to(project_root)),
+                )
+                if resolved_file in seen:
                     continue
-                seen.add(file_path)
-                yield file_path
+                if python_only and resolved_file.suffix != ".py":
+                    continue
+                seen.add(resolved_file)
+                yield resolved_file
 
     def _resolve_project_path(self, project_root: Path, relative_path: str) -> Path:
-        normalized = validate_relative_path(relative_path)
-        path = resolve_relative_path(project_root, normalized).resolve()
+        path = resolve_project_path(project_root, relative_path)
         if not path.exists() or (not path.is_file() and not path.is_dir()):
             raise DomainError(
                 code=ErrorCode.PATH_NOT_FOUND,

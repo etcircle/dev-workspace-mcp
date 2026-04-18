@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from collections.abc import Sequence
 
+from dev_workspace_mcp.cli.main import main as cli_main
 from dev_workspace_mcp.mcp_server.server import create_server
 from dev_workspace_mcp.mcp_server.transport_http import run_http_transport_async
+from dev_workspace_mcp.mcp_server.transport_stdio import run_stdio_transport_async
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,12 +25,31 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, help="Bind port override.")
     serve.add_argument("--path", default="/mcp", help="HTTP path for the MCP endpoint.")
     serve.add_argument("--log-level", default="info", help="Uvicorn log level.")
+
+    subparsers.add_parser("stdio", help="Run the native stdio MCP transport.")
+
+    cli = subparsers.add_parser("cli", help="Run the in-process JSON-first CLI.")
+    cli.add_argument("cli_args", nargs=argparse.REMAINDER)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    argv_list = list(argv) if argv is not None else list(sys.argv[1:])
+    if argv_list and argv_list[0] == "cli":
+        exit_code = cli_main(argv_list[1:])
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_args(argv_list)
+
+    if args.command == "cli":
+        exit_code = cli_main(args.cli_args)
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
     server = create_server()
 
     if args.command in {None, "describe"}:
@@ -48,6 +70,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 log_level=args.log_level,
             )
         )
+        return
+
+    if args.command == "stdio":
+        asyncio.run(run_stdio_transport_async(server))
         return
 
     parser.error(f"Unknown command: {args.command}")

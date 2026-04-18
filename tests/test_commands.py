@@ -16,6 +16,12 @@ def _build_tools(workspace_root: Path):
     return build_tool_registry(registry)
 
 
+def _write_policy(project_root: Path, lines: list[str]) -> None:
+    policy_dir = project_root / ".devworkspace"
+    policy_dir.mkdir(exist_ok=True)
+    (policy_dir / "policy.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _make_allowed_python(project_root: Path) -> str:
     wrapper = project_root / "bin" / "python3"
     wrapper.parent.mkdir(exist_ok=True)
@@ -45,6 +51,14 @@ def test_run_command_foreground_success_and_get_job_returns_completed_record(
     app_dir.mkdir()
     (app_dir / "marker.txt").write_text("hello from app\n", encoding="utf-8")
     python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
     tools = _build_tools(workspace_root)
 
     result = tools.run(
@@ -88,16 +102,23 @@ def test_run_command_rejects_blocked_command(workspace_root, make_manifest_proje
     )
 
     assert result["ok"] is False
-    assert result["error"]["code"] == "COMMAND_NOT_ALLOWED"
-    assert result["error"]["hint"] == "blocked by allowlist"
+    assert result["error"]["code"] == "POLICY_DENIED"
 
 
 def test_run_command_executes_manifest_preset(workspace_root, make_manifest_project) -> None:
-    make_manifest_project(
+    project_root = make_manifest_project(
         services_block=[
             "presets:",
             "  say_hi: ['echo', 'preset-ok']",
         ]
+    )
+    _write_policy(
+        project_root,
+        [
+            "command_policy:",
+            "  commands:",
+            "    echo: {}",
+        ],
     )
     tools = _build_tools(workspace_root)
 
@@ -131,6 +152,14 @@ def test_background_job_can_be_cancelled_and_get_job_reflects_cancellation(
 ) -> None:
     project_root = make_manifest_project()
     python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
     tools = _build_tools(workspace_root)
 
     run_result = tools.run(
@@ -170,3 +199,131 @@ def test_background_job_can_be_cancelled_and_get_job_reflects_cancellation(
     assert fetched["ok"] is True
     assert fetched["data"]["job"]["status"] == "cancelled"
     assert fetched["data"]["job"]["exit_code"] is not None
+
+
+def test_run_command_denies_cwd_symlink_escape(workspace_root, make_manifest_project) -> None:
+    project_root = make_manifest_project()
+    outside_dir = workspace_root / "outside-command-cwd"
+    outside_dir.mkdir()
+    (project_root / "linked").symlink_to(outside_dir, target_is_directory=True)
+    python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
+    tools = _build_tools(workspace_root)
+
+    result = tools.run(
+        "run_command",
+        project_id="manifest-id",
+        argv=[python_cmd, "-c", "print('nope')"],
+        cwd="linked",
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PATH_OUTSIDE_PROJECT"
+
+
+def test_run_command_does_not_inherit_secret_env_vars_but_keeps_allowed_ones(
+    workspace_root,
+    make_manifest_project,
+    monkeypatch,
+) -> None:
+    project_root = make_manifest_project()
+    python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "env:",
+            "  allow: ['PATH', 'HOME', 'LANG', 'LC_ALL', 'APP_MODE']",
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "top-secret")
+    monkeypatch.setenv("APP_MODE", "dev")
+    tools = _build_tools(workspace_root)
+
+    result = tools.run(
+        "run_command",
+        project_id="manifest-id",
+        argv=[
+            python_cmd,
+            "-c",
+            (
+                "import os; "
+                "print(os.getenv('AWS_SECRET_ACCESS_KEY')); "
+                "print(os.getenv('APP_MODE'))"
+            ),
+        ],
+    )
+
+    assert result["ok"] is True
+    assert _stdout_text(result["data"]["job"]) == "None\ndev\n"
+
+
+
+def test_run_command_filters_explicit_env_overrides_through_policy(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "env:",
+            "  allow: ['PATH', 'HOME', 'LANG', 'LC_ALL', 'APP_MODE']",
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
+    tools = _build_tools(workspace_root)
+
+    result = tools.run(
+        "run_command",
+        project_id="manifest-id",
+        argv=[
+            python_cmd,
+            "-c",
+            (
+                "import os; "
+                "print(os.getenv('FOO')); "
+                "print(os.getenv('LD_PRELOAD')); "
+                "print(os.getenv('APP_MODE'))"
+            ),
+        ],
+        env={"FOO": "bar", "LD_PRELOAD": "/tmp/x.so", "APP_MODE": "prod"},
+    )
+
+    assert result["ok"] is True
+    assert _stdout_text(result["data"]["job"]) == "None\nNone\nprod\n"
+
+
+def test_run_command_denies_argv_combinations_blocked_by_project_policy(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    _write_policy(
+        project_root,
+        [
+            "command_policy:",
+            "  commands:",
+            "    echo:",
+            "      deny_args:",
+            "        - ['blocked']",
+        ],
+    )
+    tools = _build_tools(workspace_root)
+
+    result = tools.run("run_command", project_id="manifest-id", argv=["echo", "blocked"])
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "POLICY_DENIED"

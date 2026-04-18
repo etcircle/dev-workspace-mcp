@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8081
     workspace_roots: list[str] = Field(default_factory=lambda: ["~/dev-workspaces"])
-    command_policy: str = "allowlist"
+    command_policy: str = "policy"
     codegraph_max_matches: int = 200
     codegraph_max_source_chars: int = 20_000
     default_log_tail_lines: int = 120

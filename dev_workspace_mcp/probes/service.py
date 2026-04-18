@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
-from dev_workspace_mcp.commands.allowlist import CommandAllowlist
+from dev_workspace_mcp.commands.allowlist import CommandAllowlist, evaluate_command_policy
 from dev_workspace_mcp.files.validation import validate_relative_path
 from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.models.errors import ErrorCode
 from dev_workspace_mcp.models.probes import ListProbesResponse, ProbeRunResult, ProbeSummary
+from dev_workspace_mcp.policy.env import build_subprocess_env
 from dev_workspace_mcp.projects.registry import ProjectRegistry
-from dev_workspace_mcp.shared.paths import resolve_relative_path
+from dev_workspace_mcp.shared.paths import resolve_project_path
+from dev_workspace_mcp.shared.security import redact_secrets
 
 
 class ProbeService:
@@ -53,28 +56,29 @@ class ProbeService:
                 code=ErrorCode.VALIDATION_ERROR,
                 message=f"Probe '{probe_name}' does not define an argv command.",
             )
-        if self.enforce_allowlist and not self.allowlist.is_allowed(definition.argv):
-            raise DomainError(
-                code=ErrorCode.COMMAND_NOT_ALLOWED,
-                message=f"Probe command is not allowed: {definition.argv[0]}",
-                hint=self.allowlist.explain(definition.argv),
-            )
 
+        self._ensure_allowed(project_id, project.policy, definition.argv)
         cwd = self._resolve_probe_cwd(Path(project.root_path), definition.cwd)
+        timeout = definition.timeout_sec
+        decision = evaluate_command_policy(project.policy, definition.argv)
+        if decision.rule is not None and decision.rule.max_seconds is not None:
+            timeout = min(timeout, decision.rule.max_seconds)
+
         try:
             result = subprocess.run(
                 definition.argv,
                 cwd=str(cwd),
+                env=build_subprocess_env(os.environ, project.policy.env),
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=definition.timeout_sec,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
             raise DomainError(
                 code=ErrorCode.JOB_TIMEOUT,
-                message=f"Probe '{probe_name}' timed out after {definition.timeout_sec} seconds.",
-                details={"probe_name": probe_name, "timeout_sec": definition.timeout_sec},
+                message=f"Probe '{probe_name}' timed out after {timeout} seconds.",
+                details={"probe_name": probe_name, "timeout_sec": timeout},
             ) from exc
 
         return ProbeRunResult(
@@ -82,15 +86,33 @@ class ProbeService:
             ok=result.returncode == 0,
             cwd=validate_relative_path(definition.cwd),
             argv=list(definition.argv),
-            timeout_sec=definition.timeout_sec,
+            timeout_sec=timeout,
             exit_code=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
+            stdout=redact_secrets(result.stdout, env_policy=project.policy.env),
+            stderr=redact_secrets(result.stderr, env_policy=project.policy.env),
         )
+
+    def _ensure_allowed(self, project_id: str, policy, argv: list[str]) -> None:
+        if self.enforce_allowlist and not self.allowlist.is_allowed(argv):
+            raise DomainError(
+                code=ErrorCode.COMMAND_NOT_ALLOWED,
+                message=f"Probe command is not allowed: {argv[0]}",
+                hint=self.allowlist.explain(argv),
+                details={"project_id": project_id, "argv": list(argv)},
+            )
+
+        decision = evaluate_command_policy(policy, argv)
+        if not decision.allowed:
+            raise DomainError(
+                code=ErrorCode.POLICY_DENIED,
+                message=decision.message,
+                hint=decision.hint,
+                details={"project_id": project_id, "argv": list(argv)},
+            )
 
     def _resolve_probe_cwd(self, project_root: Path, relative_cwd: str) -> Path:
         normalized = validate_relative_path(relative_cwd)
-        cwd = resolve_relative_path(project_root, normalized).resolve()
+        cwd = resolve_project_path(project_root, normalized)
         if not cwd.exists() or not cwd.is_dir():
             raise DomainError(
                 code=ErrorCode.PATH_NOT_FOUND,
