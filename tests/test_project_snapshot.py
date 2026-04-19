@@ -36,6 +36,10 @@ def test_project_snapshot_warns_when_manifest_and_agents_are_missing(
     assert result["data"]["git"]["is_repo"] is True
     assert result["data"]["watcher"]["configured"] is False
     assert result["data"]["recent_changed_files"] == []
+    assert result["data"]["memory_index_status"] == "missing"
+    assert result["data"]["recent_decision_titles"] == []
+    assert result["data"]["standards_docs"] == []
+    assert result["data"]["tracking_systems"] == ["GitHub Issues", "SQLite Memory Index"]
     assert result["data"]["policy"]["command_default"] == "deny"
     assert result["data"]["policy"]["allow_localhost"] is True
     assert any(
@@ -218,6 +222,10 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
             "Finish boot packet",
             "Verify snapshot output",
         ]
+        assert result["data"]["memory_index_status"] == "missing"
+        assert result["data"]["recent_decision_titles"] == []
+        assert result["data"]["standards_docs"] == []
+        assert result["data"]["tracking_systems"] == ["GitHub Issues", "SQLite Memory Index"]
         assert result["data"]["recommended_commands"] == [
             "run_command preset=test_backend",
             "run_probe probe_name=backend_db",
@@ -226,6 +234,8 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
         ]
         assert result["data"]["recommended_next_tools"] == [
             "read_state_doc",
+            "memory_index_status",
+            "reindex_workspace_memory",
             "run_command",
             "run_probe",
             "service_status",
@@ -255,11 +265,14 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
                 "and background jobs under project policy."
             ),
             "search": (
-                "Text search is available via grep, and codegraph symbol tools "
-                "use an in-memory snapshot. "
-                "There is no separate persistent search index service yet."
+                "Text search is available via grep, codegraph symbol tools use an "
+                "in-memory snapshot, and search_workspace_memory can query the local "
+                "SQLite memory index when it has been indexed."
             ),
-            "github": "GitHub remote APIs and PR helpers are not implemented in this server.",
+            "github": (
+                "GitHub Issues remain the canonical work tracker, but GitHub remote APIs "
+                "and write helpers are not implemented in this server."
+            ),
         }
 
         agents_doc = next(doc for doc in result["data"]["state_docs"] if doc["kind"] == "agents")
@@ -292,6 +305,90 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
     finally:
         stopped = tools.run("stop_service", project_id="manifest-id", service_name="backend")
         assert stopped["ok"] is True
+
+
+def test_project_snapshot_adds_compact_memory_hints(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    state_dir = project_root / ".devworkspace"
+    standards_dir = project_root / "docs" / "standards"
+    decisions_dir = project_root / "docs" / "decisions"
+    state_dir.mkdir()
+    standards_dir.mkdir(parents=True)
+    decisions_dir.mkdir(parents=True)
+    (project_root / "AGENTS.md").write_text(
+        "# Repo Rules\n- Keep session summaries concise\n",
+        encoding="utf-8",
+    )
+    (state_dir / "memory.md").write_text(
+        "# Context\n- Prefer repo docs\n",
+        encoding="utf-8",
+    )
+    (state_dir / "roadmap.md").write_text(
+        "# Roadmap\n- Ship wave one\n",
+        encoding="utf-8",
+    )
+    (standards_dir / "backend.md").write_text(
+        "# Backend\nUse boring service seams.\n",
+        encoding="utf-8",
+    )
+    (standards_dir / "frontend.md").write_text(
+        "# Frontend\nPrefer explicit contracts.\n",
+        encoding="utf-8",
+    )
+    (decisions_dir / "0001-source-of-truth.md").write_text(
+        "# Source of truth\nGitHub is canonical.\n",
+        encoding="utf-8",
+    )
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+    assert tools.run("reindex_workspace_memory", project_id="manifest-id")["ok"] is True
+    assert (
+        tools.run(
+            "record_session_summary",
+            project_id="manifest-id",
+            source_platform="openclaw",
+            source_session_ref="session-1",
+            agent_name="Hermes",
+            summary="Captured the final authority split.",
+            decisions=[
+                {
+                    "title": "Keep GitHub canonical for tracking",
+                    "status": "active",
+                    "rationale": "SQLite remains a local recall layer.",
+                    "doc_path": "docs/decisions/0001-source-of-truth.md",
+                }
+            ],
+            source_refs=[
+                {"kind": "doc", "value": "docs/decisions/0001-source-of-truth.md"},
+            ],
+        )["ok"]
+        is True
+    )
+
+    snapshot = tools.run("project_snapshot", project_id="manifest-id")
+
+    assert snapshot["ok"] is True
+    assert snapshot["data"]["memory_index_status"] == "ready"
+    assert snapshot["data"]["recent_decision_titles"] == [
+        "Keep GitHub canonical for tracking",
+        "Source of truth",
+    ]
+    assert snapshot["data"]["standards_docs"] == [
+        "docs/standards/backend.md",
+        "docs/standards/frontend.md",
+    ]
+    assert snapshot["data"]["tracking_systems"] == [
+        "GitHub Issues",
+        "Repo Decisions",
+        "SQLite Memory Index",
+    ]
+    assert "search_workspace_memory" in snapshot["data"]["recommended_next_tools"]
+    assert "reindex_workspace_memory" not in snapshot["data"]["recommended_next_tools"]
 
 
 def test_project_snapshot_degrades_when_state_docs_or_watcher_health_fail(

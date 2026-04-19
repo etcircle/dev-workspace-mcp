@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from dev_workspace_mcp.cli.json_output import write_json
 from dev_workspace_mcp.config import get_settings
+from dev_workspace_mcp.mcp_server.errors import DomainError
+from dev_workspace_mcp.mcp_server.result_envelope import error_result
 from dev_workspace_mcp.mcp_server.tool_registry import ToolRegistry, build_tool_registry
+from dev_workspace_mcp.models.errors import ErrorCode, ValidationIssue
 from dev_workspace_mcp.runtime import create_runtime
 
 
@@ -140,6 +146,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail instead of creating missing headings.",
     )
 
+    memory_index = subparsers.add_parser("memory-index", help="Workspace memory index helpers.")
+    memory_index_subparsers = memory_index.add_subparsers(
+        dest="memory_index_command",
+        required=True,
+    )
+    memory_index_status = memory_index_subparsers.add_parser(
+        "status",
+        help="Read workspace memory index freshness and counts.",
+    )
+    memory_index_status.add_argument("project_id")
+    memory_index_reindex = memory_index_subparsers.add_parser(
+        "reindex",
+        help="Rebuild the canonical workspace memory index.",
+    )
+    memory_index_reindex.add_argument("project_id")
+    memory_index_search = memory_index_subparsers.add_parser(
+        "search",
+        help="Search indexed workspace memory.",
+    )
+    memory_index_search.add_argument("project_id")
+    memory_index_search.add_argument("--query", required=True)
+    memory_index_search.add_argument(
+        "--scope",
+        choices=["all", "docs", "sessions", "decisions"],
+        default="all",
+    )
+    memory_index_search.add_argument("--limit", type=int, default=10)
+    memory_index_record = memory_index_subparsers.add_parser(
+        "record-session",
+        help="Record one structured session summary from JSON input.",
+    )
+    memory_index_record.add_argument("project_id")
+    memory_index_record.add_argument(
+        "--input",
+        required=True,
+        help="Path to summary JSON, or '-' to read JSON from stdin.",
+    )
+
     return parser
 
 
@@ -221,7 +265,80 @@ def _run_cli_command(
             create_missing_sections=not args.no_create_missing_sections,
         )
 
+    if args.command == "memory-index":
+        return _run_memory_index_command(tools, args)
+
     parser.error(f"Unsupported CLI command: {args.command}")
+
+
+def _run_memory_index_command(tools: ToolRegistry, args: argparse.Namespace) -> dict[str, Any]:
+    if args.memory_index_command == "status":
+        return tools.run("memory_index_status", project_id=args.project_id)
+
+    if args.memory_index_command == "reindex":
+        return tools.run("reindex_workspace_memory", project_id=args.project_id)
+
+    if args.memory_index_command == "search":
+        return tools.run(
+            "search_workspace_memory",
+            project_id=args.project_id,
+            query=args.query,
+            scope=args.scope,
+            limit=args.limit,
+        )
+
+    payload = _load_json_input(args.input)
+    if payload.get("ok") is False:
+        return payload
+    summary_payload = dict(payload["data"])
+    input_project_id = summary_payload.get("project_id")
+    if input_project_id is not None and input_project_id != args.project_id:
+        return _cli_validation_error(
+            message=(
+                "record-session input project_id does not match the CLI project_id argument."
+            )
+        )
+    summary_payload["project_id"] = args.project_id
+    return tools.run("record_session_summary", **summary_payload)
+
+
+
+def _load_json_input(input_path: str) -> dict[str, Any]:
+    try:
+        raw_input = (
+            sys.stdin.read()
+            if input_path == "-"
+            else Path(input_path).read_text(encoding="utf-8")
+        )
+    except OSError as exc:
+        return _cli_validation_error(message=f"Could not read JSON input: {exc}")
+    try:
+        payload = json.loads(raw_input)
+    except json.JSONDecodeError as exc:
+        return _cli_validation_error(message=f"Input must be valid JSON: {exc.msg}")
+    if not isinstance(payload, dict):
+        return _cli_validation_error(message="Input JSON must be an object.")
+    return {"ok": True, "data": payload}
+
+
+
+def _cli_validation_error(*, message: str) -> dict[str, Any]:
+    return error_result(
+        DomainError(
+            code=ErrorCode.VALIDATION_ERROR,
+            message="Invalid CLI input.",
+            hint="Check the JSON payload and CLI arguments.",
+            details={
+                "issues": [
+                    ValidationIssue(
+                        field="__root__",
+                        message=message,
+                    ).model_dump(mode="json")
+                ]
+            },
+        )
+    )
+
 
 
 def _add_bootstrap_common_arguments(parser: argparse.ArgumentParser) -> None:

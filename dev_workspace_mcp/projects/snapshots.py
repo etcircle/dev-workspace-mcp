@@ -72,10 +72,14 @@ _CAPABILITIES = CapabilitySummary(
         "and background jobs under project policy."
     ),
     search=(
-        "Text search is available via grep, and codegraph symbol tools use an in-memory snapshot. "
-        "There is no separate persistent search index service yet."
+        "Text search is available via grep, codegraph symbol tools use an in-memory snapshot, "
+        "and search_workspace_memory can query the local SQLite memory index "
+        "when it has been indexed."
     ),
-    github="GitHub remote APIs and PR helpers are not implemented in this server.",
+    github=(
+        "GitHub Issues remain the canonical work tracker, but GitHub remote APIs and write helpers "
+        "are not implemented in this server."
+    ),
 )
 
 
@@ -84,6 +88,7 @@ def build_project_snapshot(
     project_id: str,
     *,
     service_manager=None,
+    memory_index_service_factory=None,
 ) -> tuple[ProjectSnapshot, list[WarningMessage]]:
     record = registry.require(project_id)
     warnings: list[WarningMessage] = []
@@ -110,6 +115,33 @@ def build_project_snapshot(
         watched_paths=record.manifest.codegraph.watch_paths,
         status="configured" if record.manifest.codegraph.watch_paths else "not_configured",
     )
+    memory_index_status = None
+    recent_decision_titles: list[str] = []
+    if memory_index_service_factory is not None:
+        try:
+            memory_service = memory_index_service_factory(record.project_id)
+            memory_index_status = memory_service.get_status().status
+            recent_decision_titles = memory_service.recent_decision_titles(limit=_SUMMARY_LIMIT)
+        except Exception:
+            warnings.append(
+                WarningMessage(
+                    code="MEMORY_INDEX_STATUS_UNAVAILABLE",
+                    message=(
+                        "Workspace memory hints could not be refreshed cleanly; "
+                        "returning repo-local snapshot context only."
+                    ),
+                )
+            )
+    recent_decision_titles = _merge_unique_items(
+        recent_decision_titles,
+        _recent_decision_doc_titles(project_root, limit=_SUMMARY_LIMIT),
+        limit=_SUMMARY_LIMIT,
+    )
+    standards_docs = _standards_doc_paths(project_root, limit=_SUMMARY_LIMIT)
+    tracking_systems = _tracking_systems(
+        include_repo_decisions=bool(recent_decision_titles),
+        include_memory_index=memory_index_status is not None,
+    )
 
     snapshot = ProjectSnapshot(
         project=record,
@@ -125,8 +157,17 @@ def build_project_snapshot(
         agents_summary=_summary_lines_from_markdown(state_doc_text["agents"]),
         memory_summary=_summary_lines_from_markdown(state_doc_text["memory"]),
         active_tasks=_summary_lines_from_state_doc(state_doc_text["tasks"], heading="Active"),
+        memory_index_status=memory_index_status,
+        recent_decision_titles=recent_decision_titles,
+        standards_docs=standards_docs,
+        tracking_systems=tracking_systems,
         recommended_commands=_build_recommended_commands(record),
-        recommended_next_tools=_build_recommended_next_tools(record, state_docs, watcher),
+        recommended_next_tools=_build_recommended_next_tools(
+            record,
+            state_docs,
+            watcher,
+            memory_index_status=memory_index_status,
+        ),
         capabilities=_CAPABILITIES.model_copy(deep=True),
     )
     return snapshot, warnings
@@ -336,10 +377,18 @@ def _build_recommended_next_tools(
     record,
     state_docs: list[StateDocSummary],
     watcher: WatcherSummary,
+    *,
+    memory_index_status: str | None,
 ) -> list[str]:
     tools: list[str] = []
     if any(doc.exists for doc in state_docs):
         tools.append("read_state_doc")
+    if memory_index_status is not None:
+        tools.append("memory_index_status")
+        if memory_index_status in {"missing", "empty", "stale"}:
+            tools.append("reindex_workspace_memory")
+        if memory_index_status in {"ready", "stale"}:
+            tools.append("search_workspace_memory")
     if record.manifest.presets:
         tools.append("run_command")
     if record.manifest.probes:
@@ -350,6 +399,85 @@ def _build_recommended_next_tools(
         tools.append("watcher_health")
     tools.extend(["read_file", "grep"])
     return list(OrderedDict.fromkeys(tools))
+
+
+
+def _standards_doc_paths(project_root: Path, *, limit: int) -> list[str]:
+    standards_dir = project_root / "docs" / "standards"
+    if limit <= 0 or not standards_dir.is_dir():
+        return []
+    paths = [
+        path.relative_to(project_root).as_posix()
+        for path in sorted(standards_dir.rglob("*.md"))
+        if path.is_file() and not path.is_symlink()
+    ]
+    return paths[:limit]
+
+
+
+def _recent_decision_doc_titles(project_root: Path, *, limit: int) -> list[str]:
+    decisions_dir = project_root / "docs" / "decisions"
+    if limit <= 0 or not decisions_dir.is_dir():
+        return []
+    candidates = [
+        path
+        for path in decisions_dir.rglob("*.md")
+        if path.is_file() and not path.is_symlink()
+    ]
+    candidates.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+    titles: list[str] = []
+    for path in candidates:
+        title = _markdown_title(path) or path.stem
+        titles.append(title)
+        if len(titles) >= limit:
+            break
+    return titles
+
+
+
+def _tracking_systems(
+    *,
+    include_repo_decisions: bool,
+    include_memory_index: bool,
+) -> list[str]:
+    systems = ["GitHub Issues"]
+    if include_repo_decisions:
+        systems.append("Repo Decisions")
+    if include_memory_index:
+        systems.append("SQLite Memory Index")
+    return systems
+
+
+
+def _merge_unique_items(*groups: list[str], limit: int) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            normalized = item.strip()
+            if not normalized or normalized in seen:
+                continue
+            merged.append(normalized)
+            seen.add(normalized)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+
+def _markdown_title(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            if title:
+                return title
+    return None
+
 
 
 def _preview_lines(text: str) -> list[str]:

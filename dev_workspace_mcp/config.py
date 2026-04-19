@@ -4,7 +4,7 @@ from functools import cached_property
 from ipaddress import ip_address
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOCAL_HTTP_HOSTNAMES = frozenset({"localhost"})
@@ -24,10 +24,34 @@ class Settings(BaseSettings):
     max_command_output_bytes: int = 200_000
     max_log_bytes: int = 200_000
     subprocess_stream_chunk_bytes: int = 4096
+    memory_index_state_dirname: str = ".devworkspace"
+    memory_index_db_filename: str = "memory_index.sqlite3"
+    memory_index_chunk_size: int = 1200
+    memory_index_chunk_overlap: int = 150
+    memory_index_max_search_results: int = 50
 
     @cached_property
     def expanded_workspace_roots(self) -> list[Path]:
         return [Path(root).expanduser().resolve() for root in self.workspace_roots]
+
+    @model_validator(mode="after")
+    def _validate_memory_index_settings(self) -> Settings:
+        if self.memory_index_chunk_overlap >= self.memory_index_chunk_size:
+            raise ValueError(
+                "memory_index_chunk_overlap must be smaller than "
+                "memory_index_chunk_size."
+            )
+        if Path(self.memory_index_db_filename).name != self.memory_index_db_filename:
+            raise ValueError("memory_index_db_filename must be a filename, not a nested path.")
+        if Path(self.memory_index_state_dirname).name != self.memory_index_state_dirname:
+            raise ValueError("memory_index_state_dirname must be a single directory name.")
+        return self
+
+    def memory_index_dir(self, project_root: str | Path) -> Path:
+        return Path(project_root).expanduser().resolve() / self.memory_index_state_dirname
+
+    def memory_index_db_path(self, project_root: str | Path) -> Path:
+        return self.memory_index_dir(project_root) / self.memory_index_db_filename
 
 
 def normalize_http_host(host: str) -> str:

@@ -21,6 +21,12 @@ from dev_workspace_mcp.models.connections import (
     TestConnectionRequest,
 )
 from dev_workspace_mcp.models.errors import ErrorCode, ValidationIssue
+from dev_workspace_mcp.models.memory_index import (
+    MemoryIndexStatusRequest,
+    RecordSessionSummaryRequest,
+    ReindexWorkspaceMemoryRequest,
+    SearchWorkspaceMemoryRequest,
+)
 from dev_workspace_mcp.models.project_bootstrap import BootstrapProjectRequest
 from dev_workspace_mcp.models.projects import WatcherSummary
 from dev_workspace_mcp.models.state_docs import StateDocKind
@@ -87,6 +93,7 @@ def build_tool_registry(
     http_client = runtime_services.http_client
     bootstrap_service = runtime_services.bootstrap_service
     connection_service = runtime_services.connection_service
+    memory_index_service_factory = runtime_services.memory_index_service_factory
 
     registry.register(
         ToolDefinition(
@@ -307,6 +314,13 @@ def build_tool_registry(
     )
     registry.register(
         ToolDefinition(
+            name="memory_index_status",
+            description="Report workspace memory index freshness and counts for one project.",
+            handler=_make_memory_index_status_handler(memory_index_service_factory),
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="module_overview",
             description="Summarize the structure of one source module.",
             handler=lambda project_id, path: ok(
@@ -348,6 +362,7 @@ def build_tool_registry(
                 project_registry,
                 codegraph_service,
                 service_manager,
+                memory_index_service_factory,
                 project_id,
             ),
         )
@@ -408,6 +423,20 @@ def build_tool_registry(
     )
     registry.register(
         ToolDefinition(
+            name="record_session_summary",
+            description="Record one structured session summary with decisions and source refs.",
+            handler=_make_record_session_summary_handler(memory_index_service_factory),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="reindex_workspace_memory",
+            description="Reindex canonical workspace memory docs for one project.",
+            handler=_make_reindex_workspace_memory_handler(memory_index_service_factory),
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="restart_service",
             description="Restart a declared long-running service.",
             handler=lambda project_id, service_name: ok(
@@ -429,6 +458,13 @@ def build_tool_registry(
             handler=lambda project_id, probe_name: ok(
                 probe_service.run_probe(project_id, probe_name)
             ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="search_workspace_memory",
+            description="Search indexed workspace docs, session summaries, and decisions.",
+            handler=_make_search_workspace_memory_handler(memory_index_service_factory),
         )
     )
     registry.register(
@@ -507,12 +543,14 @@ def _project_snapshot_handler(
     project_registry,
     codegraph_service: CodegraphService,
     service_manager: ServiceManager,
+    memory_index_service_factory,
     project_id: str,
 ) -> dict[str, Any]:
     snapshot, warnings = build_project_snapshot(
         project_registry,
         project_id,
         service_manager=service_manager,
+        memory_index_service_factory=memory_index_service_factory,
     )
     try:
         watcher = codegraph_service.watcher_health(project_id)
@@ -634,6 +672,128 @@ def _make_test_connection_handler(connection_service) -> ToolHandler:
         )
 
     return _handler
+
+
+def _make_memory_index_status_handler(memory_index_service_factory) -> ToolHandler:
+    def _handler(project_id) -> dict[str, Any]:
+        request = _validated_model(
+            MemoryIndexStatusRequest,
+            {"project_id": project_id},
+            tool_name="memory_index_status",
+        )
+        try:
+            response = memory_index_service_factory(request.project_id).get_status()
+        except ValueError as exc:
+            raise _memory_index_validation_error(
+                tool_name="memory_index_status",
+                message=str(exc),
+            ) from exc
+        return ok(response)
+
+    return _handler
+
+
+def _make_reindex_workspace_memory_handler(memory_index_service_factory) -> ToolHandler:
+    def _handler(project_id, reason="manual") -> dict[str, Any]:
+        request = _validated_model(
+            ReindexWorkspaceMemoryRequest,
+            {"project_id": project_id, "reason": reason},
+            tool_name="reindex_workspace_memory",
+        )
+        try:
+            response = memory_index_service_factory(request.project_id).reindex(request)
+        except ValueError as exc:
+            raise _memory_index_validation_error(
+                tool_name="reindex_workspace_memory",
+                message=str(exc),
+            ) from exc
+        return ok(response)
+
+    return _handler
+
+
+def _make_search_workspace_memory_handler(memory_index_service_factory) -> ToolHandler:
+    def _handler(project_id, query, scope="all", limit=10) -> dict[str, Any]:
+        request = _validated_model(
+            SearchWorkspaceMemoryRequest,
+            {
+                "project_id": project_id,
+                "query": query,
+                "scope": scope,
+                "limit": limit,
+            },
+            tool_name="search_workspace_memory",
+        )
+        try:
+            response = memory_index_service_factory(request.project_id).search(request)
+        except ValueError as exc:
+            raise _memory_index_validation_error(
+                tool_name="search_workspace_memory",
+                message=str(exc),
+            ) from exc
+        return ok(response)
+
+    return _handler
+
+
+def _make_record_session_summary_handler(memory_index_service_factory) -> ToolHandler:
+    def _handler(
+        project_id,
+        source_platform,
+        source_session_ref,
+        source_thread_ref=None,
+        agent_name=None,
+        started_at=None,
+        ended_at=None,
+        summary=None,
+        outcome=None,
+        decisions=None,
+        source_refs=None,
+    ) -> dict[str, Any]:
+        request = _validated_model(
+            RecordSessionSummaryRequest,
+            {
+                "project_id": project_id,
+                "source_platform": source_platform,
+                "source_session_ref": source_session_ref,
+                "source_thread_ref": source_thread_ref,
+                "agent_name": agent_name,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "summary": summary,
+                "outcome": outcome,
+                "decisions": decisions or [],
+                "source_refs": source_refs or [],
+            },
+            tool_name="record_session_summary",
+        )
+        try:
+            service = memory_index_service_factory(request.project_id)
+            response = service.record_session_summary(request)
+        except ValueError as exc:
+            raise _memory_index_validation_error(
+                tool_name="record_session_summary",
+                message=str(exc),
+            ) from exc
+        return ok(response)
+
+    return _handler
+
+
+def _memory_index_validation_error(*, tool_name: str, message: str) -> DomainError:
+    return DomainError(
+        code=ErrorCode.VALIDATION_ERROR,
+        message=f"Invalid arguments for tool: {tool_name}",
+        hint="Check the required fields and value formats for this tool.",
+        details={
+            "issues": [
+                ValidationIssue(
+                    field="__root__",
+                    message=message,
+                ).model_dump(mode="json")
+            ]
+        },
+    )
 
 
 def _make_run_command_handler(command_service: CommandService) -> ToolHandler:

@@ -136,6 +136,10 @@ class ProjectSnapshot(BaseModel):
     agents_summary: list[str] = Field(default_factory=list)
     memory_summary: list[str] = Field(default_factory=list)
     active_tasks: list[str] = Field(default_factory=list)
+    memory_index_status: str | None = None
+    recent_decision_titles: list[str] = Field(default_factory=list)
+    standards_docs: list[str] = Field(default_factory=list)
+    tracking_systems: list[str] = Field(default_factory=list)
     recommended_commands: list[str] = Field(default_factory=list)
     recommended_next_tools: list[str] = Field(default_factory=list)
     capabilities: CapabilitySummary = Field(default_factory=CapabilitySummary)

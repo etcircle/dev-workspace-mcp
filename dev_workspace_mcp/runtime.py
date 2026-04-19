@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from dev_workspace_mcp.codegraph.index_manager import CodegraphIndexManager
@@ -9,6 +10,7 @@ from dev_workspace_mcp.codegraph.watcher_manager import CodegraphWatcherManager
 from dev_workspace_mcp.commands.service import CommandService
 from dev_workspace_mcp.config import Settings, get_settings
 from dev_workspace_mcp.http_tools.local_client import LocalHttpClient
+from dev_workspace_mcp.memory_index.service import MemoryIndexService
 from dev_workspace_mcp.probes.service import ProbeService
 from dev_workspace_mcp.projects.bootstrap import ProjectBootstrapService
 from dev_workspace_mcp.projects.connections import ProjectConnectionService
@@ -25,6 +27,7 @@ class RuntimeServices:
     http_client: LocalHttpClient
     bootstrap_service: ProjectBootstrapService
     connection_service: ProjectConnectionService
+    memory_index_service_factory: Callable[[str], MemoryIndexService]
 
 
 @dataclass(slots=True)
@@ -33,6 +36,18 @@ class DevWorkspaceRuntime:
     settings: Settings
     project_registry: ProjectRegistry
     services: RuntimeServices
+
+
+def create_memory_index_service(
+    project_registry: ProjectRegistry,
+    project_id: str,
+) -> MemoryIndexService:
+    project = project_registry.require(project_id)
+    return MemoryIndexService(
+        project_root=project.root_path,
+        project_id=project.project_id,
+        settings=project_registry.settings,
+    )
 
 
 def create_runtime_services(project_registry: ProjectRegistry) -> RuntimeServices:
@@ -61,6 +76,10 @@ def create_runtime_services(project_registry: ProjectRegistry) -> RuntimeService
     http_client = LocalHttpClient()
     bootstrap_service = ProjectBootstrapService(project_registry)
     connection_service = ProjectConnectionService(project_registry)
+
+    def memory_index_service_factory(project_id: str) -> MemoryIndexService:
+        return create_memory_index_service(project_registry, project_id)
+
     return RuntimeServices(
         command_service=command_service,
         service_manager=service_manager,
@@ -69,6 +88,7 @@ def create_runtime_services(project_registry: ProjectRegistry) -> RuntimeService
         http_client=http_client,
         bootstrap_service=bootstrap_service,
         connection_service=connection_service,
+        memory_index_service_factory=memory_index_service_factory,
     )
 
 
@@ -88,6 +108,7 @@ def create_runtime(settings: Settings | None = None) -> DevWorkspaceRuntime:
 __all__ = [
     "DevWorkspaceRuntime",
     "RuntimeServices",
+    "create_memory_index_service",
     "create_runtime",
     "create_runtime_services",
 ]
