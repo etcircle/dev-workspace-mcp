@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+from starlette.testclient import TestClient
+
 from dev_workspace_mcp.config import Settings
 from dev_workspace_mcp.mcp_server import server as server_module
 from dev_workspace_mcp.mcp_server.transport_http import mount_http_transport
@@ -66,6 +68,71 @@ def test_mount_http_transport_exposes_all_registered_tools(
 
     assert tool_names == EXPECTED_TOOL_NAMES
     assert "/mcp" in route_paths
+
+
+def test_http_transport_allows_no_origin_and_localhost_origin(
+    monkeypatch,
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    make_manifest_project()
+    settings = Settings(workspace_roots=[str(workspace_root)])
+    monkeypatch.setattr(server_module, "get_settings", lambda: settings)
+    server = server_module.create_server()
+    transport = mount_http_transport(server)
+
+    with TestClient(transport.app) as client:
+        no_origin_response = client.get("/mcp", headers={"accept": "text/event-stream"})
+        localhost_origin_response = client.get(
+            "/mcp",
+            headers={
+                "accept": "text/event-stream",
+                "origin": "http://localhost:3000",
+            },
+        )
+        ipv4_loopback_origin_response = client.get(
+            "/mcp",
+            headers={
+                "accept": "text/event-stream",
+                "origin": "http://127.0.0.1:3000",
+            },
+        )
+        ipv6_loopback_origin_response = client.get(
+            "/mcp",
+            headers={
+                "accept": "text/event-stream",
+                "origin": "http://[::1]:3000",
+            },
+        )
+
+    assert no_origin_response.status_code == 400
+    assert localhost_origin_response.status_code == 400
+    assert ipv4_loopback_origin_response.status_code == 400
+    assert ipv6_loopback_origin_response.status_code == 400
+
+
+def test_http_transport_rejects_unexpected_origin_before_tool_layer(
+    monkeypatch,
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    make_manifest_project()
+    settings = Settings(workspace_roots=[str(workspace_root)])
+    monkeypatch.setattr(server_module, "get_settings", lambda: settings)
+    server = server_module.create_server()
+    transport = mount_http_transport(server)
+
+    with TestClient(transport.app) as client:
+        response = client.get(
+            "/mcp",
+            headers={
+                "accept": "text/event-stream",
+                "origin": "https://evil.example",
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.text == "Origin not allowed for local MCP HTTP transport."
 
 
 def test_fastmcp_call_tool_returns_same_envelope_as_registry(

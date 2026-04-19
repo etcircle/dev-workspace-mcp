@@ -6,6 +6,7 @@ import sys
 from collections.abc import Sequence
 
 from dev_workspace_mcp.cli.main import main as cli_main
+from dev_workspace_mcp.config import build_public_bind_warning, is_local_http_host
 from dev_workspace_mcp.mcp_server.server import create_server
 from dev_workspace_mcp.mcp_server.transport_http import run_http_transport_async
 from dev_workspace_mcp.mcp_server.transport_stdio import run_stdio_transport_async
@@ -25,6 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, help="Bind port override.")
     serve.add_argument("--path", default="/mcp", help="HTTP path for the MCP endpoint.")
     serve.add_argument("--log-level", default="info", help="Uvicorn log level.")
+    serve.add_argument(
+        "--allow-public-bind",
+        action="store_true",
+        help="Allow binding HTTP to a non-local interface. Unsafe.",
+    )
 
     subparsers.add_parser("stdio", help="Run the native stdio MCP transport.")
 
@@ -60,6 +66,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         settings = server.project_registry.settings
         host = args.host or settings.host
         port = args.port or settings.port
+        _enforce_local_http_bind(host=host, allow_public_bind=args.allow_public_bind)
+        if not is_local_http_host(host):
+            print(
+                build_public_bind_warning(host=host, port=port, path=args.path),
+                file=sys.stderr,
+            )
         print(f"Serving {server.name} on http://{host}:{port}{args.path}")
         asyncio.run(
             run_http_transport_async(
@@ -77,6 +89,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     parser.error(f"Unknown command: {args.command}")
+
+
+def _enforce_local_http_bind(*, host: str, allow_public_bind: bool) -> None:
+    if allow_public_bind or is_local_http_host(host):
+        return
+    raise SystemExit(
+        f"Refusing non-local HTTP bind to {host!r}. Pass --allow-public-bind to override."
+    )
 
 
 def _describe_server(server) -> None:

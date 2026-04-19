@@ -42,7 +42,14 @@ class ServiceManager:
     ) -> None:
         self.project_registry = project_registry
         self.process_store = process_store or InMemoryProcessStore()
-        self.log_store = log_store or ServiceLogStore()
+        self.log_store = log_store or ServiceLogStore(
+            max_bytes=getattr(project_registry.settings, "max_log_bytes", None)
+        )
+        self.stream_chunk_bytes = getattr(
+            project_registry.settings,
+            "subprocess_stream_chunk_bytes",
+            4096,
+        )
         self.health_checker = health_checker or ServiceHealthChecker()
 
     def list_services(self, project_id: str) -> ListServicesResponse:
@@ -77,14 +84,31 @@ class ServiceManager:
 
         self._ensure_command_allowed(project, definition.start, service_name=service_name)
         cwd = self._resolve_service_cwd(Path(project.root_path), definition)
-        process = subprocess.Popen(
-            definition.start,
-            cwd=str(cwd),
-            env=build_subprocess_env(os.environ, project.policy.env),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        try:
+            process = subprocess.Popen(
+                definition.start,
+                cwd=str(cwd),
+                env=build_subprocess_env(os.environ, project.policy.env),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+            )
+        except OSError as exc:
+            failed_runtime = current.runtime.model_copy(
+                update={
+                    "status": "failed",
+                    "last_stopped_at": datetime.now(UTC),
+                },
+                deep=True,
+            )
+            failed_record = current.model_copy(update={"runtime": failed_runtime}, deep=True)
+            self.process_store.save(key, failed_record)
+            raise DomainError(
+                code=ErrorCode.VALIDATION_ERROR,
+                message=f"Service '{service_name}' failed to start: {exc}",
+                hint="Verify the configured executable exists and is available on PATH.",
+                details={"service_name": service_name, "argv": list(definition.start)},
+            ) from exc
         instance_id = str(uuid4())
         runtime = current.runtime.model_copy(
             update={
@@ -99,9 +123,6 @@ class ServiceManager:
             deep=True,
         )
         record = current.model_copy(update={"runtime": runtime}, deep=True)
-        record = self._apply_health(project, definition, record)
-        record = self.process_store.save(key, record)
-
         stdout_thread = threading.Thread(
             target=self._capture_stream,
             args=(key, "stdout", process.stdout, project.policy.env),
@@ -120,6 +141,25 @@ class ServiceManager:
             stdout_thread=stdout_thread,
             stderr_thread=stderr_thread,
         )
+        self.process_store.save(key, record)
+        try:
+            record = self._apply_health(project, definition, record)
+        except DomainError:
+            self._terminate_process(process, stdout_thread, stderr_thread)
+            failed_runtime = runtime.model_copy(
+                update={
+                    "status": "failed",
+                    "service_instance_id": None,
+                    "pid": None,
+                    "last_stopped_at": datetime.now(UTC),
+                },
+                deep=True,
+            )
+            failed_record = current.model_copy(update={"runtime": failed_runtime}, deep=True)
+            self.process_store.save(key, failed_record)
+            self.process_store.pop_process(key)
+            raise
+        record = self.process_store.save(key, record)
         waiter = threading.Thread(
             target=self._watch_service_exit,
             args=(project_id, service_name, definition, instance_id),
@@ -254,11 +294,49 @@ class ServiceManager:
     def _capture_stream(self, key: str, stream: str, handle, env_policy) -> None:
         if handle is None:
             return
+        buffer = b""
+        fragment_visible = False
         try:
-            for line in iter(handle.readline, ""):
-                message = redact_secrets(line.rstrip("\n"), env_policy=env_policy)
-                self.log_store.append(key, stream, message)
+            while True:
+                chunk = os.read(handle.fileno(), self.stream_chunk_bytes)
+                if not chunk:
+                    break
+                buffer += chunk
+                while True:
+                    line, separator, remainder = buffer.partition(b"\n")
+                    if not separator:
+                        break
+                    message = redact_secrets(
+                        line.decode("utf-8", errors="replace"),
+                        env_policy=env_policy,
+                    )
+                    if fragment_visible:
+                        self.log_store.close_open_fragment(key, stream, message)
+                        fragment_visible = False
+                    else:
+                        self.log_store.append(key, stream, message)
+                    buffer = remainder
+                if buffer:
+                    preview = buffer.decode("utf-8", errors="ignore")
+                    if preview:
+                        self.log_store.set_open_fragment(
+                            key,
+                            stream,
+                            redact_secrets(preview, env_policy=env_policy),
+                        )
+                        fragment_visible = True
         finally:
+            if buffer:
+                final_message = redact_secrets(
+                    buffer.decode("utf-8", errors="replace"),
+                    env_policy=env_policy,
+                )
+                if fragment_visible:
+                    self.log_store.close_open_fragment(key, stream, final_message)
+                else:
+                    self.log_store.append(key, stream, final_message)
+            else:
+                self.log_store.clear_open_fragment(key, stream)
             handle.close()
 
     def _watch_service_exit(
@@ -285,6 +363,7 @@ class ServiceManager:
         runtime = current.runtime.model_copy(
             update={
                 "status": status,
+                "service_instance_id": None,
                 "pid": None,
                 "last_stopped_at": datetime.now(UTC),
             },
@@ -295,6 +374,24 @@ class ServiceManager:
         record = self._apply_health(project, definition, record)
         self.process_store.save(key, record)
         self.process_store.pop_process(key)
+
+    def _terminate_process(
+        self,
+        process: subprocess.Popen,
+        stdout_thread: threading.Thread | None,
+        stderr_thread: threading.Thread | None,
+    ) -> None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        if stdout_thread is not None:
+            stdout_thread.join(timeout=1)
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1)
 
     def _resolve_service_cwd(self, project_root: Path, definition: ServiceDefinition) -> Path:
         cwd = resolve_project_path(project_root, definition.cwd)

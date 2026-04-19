@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from dev_workspace_mcp import app as app_module
 from dev_workspace_mcp.config import Settings
 from dev_workspace_mcp.mcp_server import server as server_module
@@ -53,7 +55,64 @@ def test_serve_http_command_preserves_existing_transport_dispatch(monkeypatch, c
             "log_level": "debug",
         },
     }
-    assert "Serving dev-workspace-mcp on http://127.0.0.1:8081/custom" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "Serving dev-workspace-mcp on http://127.0.0.1:8081/custom" in captured.out
+    assert captured.err == ""
+
+
+def test_serve_http_command_rejects_public_bind_without_override(monkeypatch, capsys) -> None:
+    server = SimpleNamespace(
+        name="dev-workspace-mcp",
+        project_registry=SimpleNamespace(
+            settings=SimpleNamespace(host="127.0.0.1", port=8081)
+        ),
+    )
+
+    async def fake_run_http_transport_async(*args, **kwargs) -> None:
+        raise AssertionError("run_http_transport_async should not be called")
+
+    monkeypatch.setattr(app_module, "create_server", lambda: server)
+    monkeypatch.setattr(app_module, "run_http_transport_async", fake_run_http_transport_async)
+
+    with pytest.raises(SystemExit, match="Refusing non-local HTTP bind"):
+        app_module.main(["serve-http", "--host", "0.0.0.0"])
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_serve_http_command_allows_public_bind_with_explicit_warning(monkeypatch, capsys) -> None:
+    calls: dict[str, object] = {}
+    server = SimpleNamespace(
+        name="dev-workspace-mcp",
+        project_registry=SimpleNamespace(
+            settings=SimpleNamespace(host="127.0.0.1", port=8081)
+        ),
+    )
+
+    async def fake_run_http_transport_async(*args, **kwargs) -> None:
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(app_module, "create_server", lambda: server)
+    monkeypatch.setattr(app_module, "run_http_transport_async", fake_run_http_transport_async)
+
+    app_module.main(["serve-http", "--host", "0.0.0.0", "--allow-public-bind"])
+
+    assert calls == {
+        "args": (server,),
+        "kwargs": {
+            "host": "0.0.0.0",
+            "port": 8081,
+            "path": "/mcp",
+            "log_level": "info",
+        },
+    }
+    captured = capsys.readouterr()
+    assert "Serving dev-workspace-mcp on http://0.0.0.0:8081/mcp" in captured.out
+    assert "WARNING: --allow-public-bind is enabled." in captured.err
+    assert "http://0.0.0.0:8081/mcp" in captured.err
 
 
 def test_stdio_command_runs_stdio_transport(monkeypatch) -> None:

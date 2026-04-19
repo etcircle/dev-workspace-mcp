@@ -32,20 +32,25 @@ class ServiceHealthChecker:
         policy: ProjectPolicy,
     ) -> ServiceHealth:
         health = service_definition.health
-        if health is None or health.type == "none":
-            if service_record.runtime.status == "running":
-                return ServiceHealth(status="healthy", message="Service process is running.")
+        if service_record.runtime.status != "running":
             if service_record.runtime.status == "failed":
                 return ServiceHealth(status="unhealthy", message="Service process failed.")
             return ServiceHealth(status="unknown", message="Service is not running.")
+        if health is None or health.type == "none":
+            return ServiceHealth(status="healthy", message="Service process is running.")
 
         if health.type == "http" and health.url:
-            response = self.http_client.request(
-                method="GET",
-                url=health.url,
-                timeout_sec=2,
-                network_policy=policy.network,
-            )
+            try:
+                response = self.http_client.request(
+                    method="GET",
+                    url=health.url,
+                    timeout_sec=2,
+                    network_policy=policy.network,
+                )
+            except DomainError as exc:
+                if exc.code == ErrorCode.HTTP_REQUEST_FAILED:
+                    return ServiceHealth(status="unhealthy", message=str(exc))
+                raise
             ok = health.expect_status is None or response.status_code == health.expect_status
             return ServiceHealth(
                 status="healthy" if ok else "unhealthy",
@@ -82,6 +87,16 @@ class ServiceHealthChecker:
                     text=True,
                     timeout=timeout,
                     check=False,
+                )
+            except FileNotFoundError as exc:
+                return ServiceHealth(
+                    status="unhealthy",
+                    message=f"health command failed to start: {exc}",
+                )
+            except OSError as exc:
+                return ServiceHealth(
+                    status="unhealthy",
+                    message=f"health command failed to start: {exc}",
                 )
             except subprocess.TimeoutExpired:
                 return ServiceHealth(

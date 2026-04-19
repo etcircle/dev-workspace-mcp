@@ -45,7 +45,15 @@ class CommandService:
     ) -> None:
         self.project_registry = project_registry
         self.allowlist = allowlist or CommandAllowlist()
-        self.job_store = job_store or InMemoryJobStore()
+        settings = project_registry.settings
+        self.max_output_bytes = getattr(settings, "max_command_output_bytes", 200_000)
+        self.stream_chunk_bytes = getattr(settings, "subprocess_stream_chunk_bytes", 4096)
+        self.stream_redaction_tail_chars = max(self.stream_chunk_bytes * 4, 256)
+        self.stream_flush_threshold_chars = max(
+            self.stream_redaction_tail_chars * 4,
+            self.stream_chunk_bytes * 8,
+        )
+        self.job_store = job_store or InMemoryJobStore(max_output_bytes=self.max_output_bytes)
         self.default_timeout_sec = default_timeout_sec
         self.enforce_allowlist = enforce_allowlist
 
@@ -77,7 +85,6 @@ class CommandService:
             background=background,
             timing=CommandTiming(started_at=started_at),
         )
-        job = self.job_store.save(job)
 
         if background:
             return RunCommandResponse(
@@ -87,7 +94,7 @@ class CommandService:
                     subprocess_env,
                     timeout,
                     env_policy=project.policy.env,
-                    max_output_bytes=_max_output_bytes(decision.rule),
+                    max_output_bytes=self._max_output_bytes(decision.rule),
                 ),
             )
         return RunCommandResponse(
@@ -97,7 +104,7 @@ class CommandService:
                 subprocess_env,
                 timeout,
                 env_policy=project.policy.env,
-                max_output_bytes=_max_output_bytes(decision.rule),
+                max_output_bytes=self._max_output_bytes(decision.rule),
             ),
         )
 
@@ -110,6 +117,20 @@ class CommandService:
         active = self.job_store.get_process(job_id)
         if active is None:
             return CancelJobResponse(job=job)
+
+        if active.process.poll() is not None:
+            if active.stdout_thread is not None:
+                active.stdout_thread.join(timeout=1)
+            if active.stderr_thread is not None:
+                active.stderr_thread.join(timeout=1)
+            completed = self.job_store.update(
+                job_id,
+                status=self._completed_process_status(job, active.process.returncode),
+                exit_code=active.process.returncode,
+                timing=_finish_timing(job.timing),
+            )
+            self.job_store.pop_process(job_id)
+            return CancelJobResponse(job=completed)
 
         if active.process.poll() is None:
             active.process.terminate()
@@ -197,31 +218,48 @@ class CommandService:
         max_output_bytes: int | None,
     ) -> JobRecord:
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 job.argv,
                 cwd=str(cwd),
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
-                check=False,
             )
-            self._store_output(job.job_id, "stdout", result.stdout, env_policy, max_output_bytes)
-            self._store_output(job.job_id, "stderr", result.stderr, env_policy, max_output_bytes)
-            return self.job_store.update(
-                job.job_id,
-                status="succeeded" if result.returncode == 0 else "failed",
-                exit_code=result.returncode,
-                timing=_finish_timing(job.timing),
-            )
-        except subprocess.TimeoutExpired as exc:
-            self._store_output(job.job_id, "stdout", exc.stdout, env_policy, max_output_bytes)
-            self._store_output(job.job_id, "stderr", exc.stderr, env_policy, max_output_bytes)
-            return self.job_store.update(
-                job.job_id,
-                status="timed_out",
-                timing=_finish_timing(job.timing),
-            )
+        except OSError as exc:
+            raise DomainError(
+                code=ErrorCode.VALIDATION_ERROR,
+                message=f"Command failed to start: {exc}",
+                hint="Verify the executable exists and is available on PATH.",
+                details={"argv": list(job.argv), "cwd": str(cwd)},
+            ) from exc
+        job = self.job_store.save(job)
+        stdout_thread, stderr_thread = self._start_output_threads(
+            job.job_id,
+            process,
+            env_policy=env_policy,
+            max_output_bytes=max_output_bytes,
+        )
+        try:
+            exit_code = process.wait(timeout=timeout)
+            status = "succeeded" if exit_code == 0 else "failed"
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+            exit_code = process.returncode
+            status = "timed_out"
+        finally:
+            if stdout_thread is not None:
+                stdout_thread.join(timeout=1)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1)
+
+        return self.job_store.update(
+            job.job_id,
+            status=status,
+            exit_code=exit_code,
+            timing=_finish_timing(job.timing),
+        )
 
     def _start_background_job(
         self,
@@ -233,28 +271,31 @@ class CommandService:
         env_policy: EnvPolicy,
         max_output_bytes: int | None,
     ) -> JobRecord:
-        process = subprocess.Popen(
-            job.argv,
-            cwd=str(cwd),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        try:
+            process = subprocess.Popen(
+                job.argv,
+                cwd=str(cwd),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            raise DomainError(
+                code=ErrorCode.VALIDATION_ERROR,
+                message=f"Command failed to start: {exc}",
+                hint="Verify the executable exists and is available on PATH.",
+                details={"argv": list(job.argv), "cwd": str(cwd)},
+            ) from exc
+        self.job_store.save(job)
         current = self.job_store.update(job.job_id, pid=process.pid)
 
-        stdout_thread = threading.Thread(
-            target=self._capture_stream,
-            args=(job.job_id, "stdout", process.stdout, env_policy, max_output_bytes),
-            daemon=True,
+        stdout_thread, stderr_thread = self._start_output_threads(
+            job.job_id,
+            process,
+            env_policy=env_policy,
+            max_output_bytes=max_output_bytes,
         )
-        stderr_thread = threading.Thread(
-            target=self._capture_stream,
-            args=(job.job_id, "stderr", process.stderr, env_policy, max_output_bytes),
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
         self.job_store.attach_process(
             job.job_id,
             process,
@@ -269,6 +310,28 @@ class CommandService:
         waiter.start()
         return current
 
+    def _start_output_threads(
+        self,
+        job_id: str,
+        process: subprocess.Popen,
+        *,
+        env_policy: EnvPolicy,
+        max_output_bytes: int | None,
+    ) -> tuple[threading.Thread | None, threading.Thread | None]:
+        stdout_thread = threading.Thread(
+            target=self._capture_stream,
+            args=(job_id, "stdout", process.stdout, env_policy, max_output_bytes),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=self._capture_stream,
+            args=(job_id, "stderr", process.stderr, env_policy, max_output_bytes),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+        return stdout_thread, stderr_thread
+
     def _capture_stream(
         self,
         job_id: str,
@@ -279,11 +342,94 @@ class CommandService:
     ) -> None:
         if handle is None:
             return
+        pending = ""
+        redacting_secret = False
         try:
-            text = handle.read()
-            self._store_output(job_id, stream, text, env_policy, max_output_bytes)
+            for text in iter(lambda: handle.read(self.stream_chunk_bytes), ""):
+                pending += _normalize_output_text(text)
+                pending, redacting_secret = self._flush_buffered_output(
+                    job_id,
+                    stream,
+                    pending,
+                    env_policy,
+                    max_output_bytes,
+                    redacting_secret=redacting_secret,
+                )
+            if not redacting_secret:
+                self._store_output(job_id, stream, pending, env_policy, max_output_bytes)
         finally:
             handle.close()
+
+    def _flush_buffered_output(
+        self,
+        job_id: str,
+        stream: str,
+        pending: str,
+        env_policy: EnvPolicy,
+        max_output_bytes: int | None,
+        *,
+        redacting_secret: bool,
+    ) -> tuple[str, bool]:
+        if not pending:
+            return "", redacting_secret
+
+        if redacting_secret:
+            secret_end = _first_whitespace_boundary(pending)
+            if secret_end < 0:
+                return "", True
+            pending = pending[secret_end:]
+            redacting_secret = False
+            if not pending:
+                return "", False
+
+        pending_secret = _pending_secret_assignment(pending, env_policy=env_policy)
+        if pending_secret is not None:
+            token_start, secret_name = pending_secret
+            if token_start > 0:
+                self._store_output(
+                    job_id,
+                    stream,
+                    pending[:token_start],
+                    env_policy,
+                    max_output_bytes,
+                )
+            self._store_output(
+                job_id,
+                stream,
+                f"{secret_name}=[REDACTED]",
+                env_policy,
+                max_output_bytes,
+            )
+            return "", True
+
+        newline_boundary = _last_line_boundary(pending)
+        if newline_boundary > 0:
+            self._store_output(
+                job_id,
+                stream,
+                pending[:newline_boundary],
+                env_policy,
+                max_output_bytes,
+            )
+            return pending[newline_boundary:], False
+
+        if len(pending) < self.stream_flush_threshold_chars:
+            return pending, False
+
+        preserve_from = max(len(pending) - self.stream_redaction_tail_chars, 0)
+        whitespace_boundary = _last_whitespace_boundary(pending, preserve_from)
+        flush_boundary = whitespace_boundary or preserve_from
+        if flush_boundary <= 0:
+            return pending, False
+
+        self._store_output(
+            job_id,
+            stream,
+            pending[:flush_boundary],
+            env_policy,
+            max_output_bytes,
+        )
+        return pending[flush_boundary:], False
 
     def _wait_for_background_job(self, job_id: str, timeout: int) -> None:
         active = self.job_store.get_process(job_id)
@@ -340,37 +486,80 @@ class CommandService:
         env_policy: EnvPolicy,
         max_output_bytes: int | None,
     ) -> None:
-        sanitized = _sanitize_output(text, env_policy=env_policy, max_output_bytes=max_output_bytes)
+        sanitized = _sanitize_output(text, env_policy=env_policy)
         if sanitized:
-            self.job_store.append_output(job_id, stream, sanitized)
+            self.job_store.append_output(
+                job_id,
+                stream,
+                sanitized,
+                max_output_bytes=max_output_bytes,
+            )
+
+    def _completed_process_status(self, job: JobRecord, returncode: int | None) -> str:
+        if job.status != "running":
+            return job.status
+        return "succeeded" if returncode == 0 else "failed"
+
+    def _max_output_bytes(self, rule: CommandRule | None) -> int | None:
+        if rule is None or rule.max_output_bytes is None:
+            return self.max_output_bytes
+        return min(rule.max_output_bytes, self.max_output_bytes)
+
+
+def _normalize_output_text(text: str | bytes | None) -> str:
+    if not text:
+        return ""
+    if isinstance(text, bytes):
+        return text.decode("utf-8", errors="replace")
+    return text
+
+
+def _last_line_boundary(text: str) -> int:
+    last_newline = max(text.rfind("\n"), text.rfind("\r"))
+    return last_newline + 1 if last_newline >= 0 else 0
+
+
+def _first_whitespace_boundary(text: str) -> int:
+    for index, char in enumerate(text):
+        if char.isspace():
+            return index
+    return -1
+
+
+def _last_whitespace_boundary(text: str, limit: int) -> int:
+    search_limit = min(max(limit, 0), len(text))
+    for index in range(search_limit - 1, -1, -1):
+        if text[index].isspace():
+            return index + 1
+    return 0
+
+
+def _pending_secret_assignment(
+    text: str,
+    *,
+    env_policy: EnvPolicy,
+) -> tuple[int, str] | None:
+    token_start = _last_whitespace_boundary(text, len(text))
+    token = text[token_start:]
+    if not token:
+        return None
+
+    sanitized = _sanitize_output(token, env_policy=env_policy)
+    if sanitized == token or not sanitized.endswith("=[REDACTED]"):
+        return None
+    return token_start, sanitized.removesuffix("=[REDACTED]")
 
 
 def _sanitize_output(
     text: str | bytes | None,
     *,
     env_policy: EnvPolicy,
-    max_output_bytes: int | None,
 ) -> str:
-    if not text:
+    normalized = _normalize_output_text(text)
+    if not normalized:
         return ""
 
-    if isinstance(text, bytes):
-        normalized = text.decode("utf-8", errors="replace")
-    else:
-        normalized = text
-
-    redacted = redact_secrets(normalized, env_policy=env_policy)
-    if max_output_bytes is None:
-        return redacted
-
-    encoded = redacted.encode("utf-8")
-    if len(encoded) <= max_output_bytes:
-        return redacted
-    return encoded[:max_output_bytes].decode("utf-8", errors="ignore")
-
-
-def _max_output_bytes(rule: CommandRule | None) -> int | None:
-    return None if rule is None else rule.max_output_bytes
+    return redact_secrets(normalized, env_policy=env_policy)
 
 
 def _finish_timing(timing: CommandTiming) -> CommandTiming:

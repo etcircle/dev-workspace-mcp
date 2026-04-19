@@ -9,6 +9,7 @@ from dev_workspace_mcp.models.state_docs import (
     StateDocument,
     WriteStateDocResponse,
 )
+from dev_workspace_mcp.shared.paths import resolve_project_path
 from dev_workspace_mcp.state_docs.limits import ensure_within_limit, get_char_limit
 from dev_workspace_mcp.state_docs.parser import parse_state_document, patch_state_document
 
@@ -25,8 +26,13 @@ class StateDocumentService:
     def __init__(self, project_root: Path) -> None:
         self.project_root = Path(project_root).resolve()
 
-    def doc_path(self, kind: StateDocKind) -> Path:
-        return self.project_root / _STATE_DOC_PATHS[kind]
+    def doc_path(self, kind: StateDocKind, *, allow_missing_leaf: bool = False) -> Path:
+        return resolve_project_path(
+            self.project_root,
+            _STATE_DOC_PATHS[kind],
+            allow_missing_leaf=allow_missing_leaf,
+            forbid_symlinks=True,
+        )
 
     def read(self, kind: StateDocKind) -> ReadStateDocResponse:
         path = self.doc_path(kind)
@@ -39,7 +45,7 @@ class StateDocumentService:
 
     def write(self, kind: StateDocKind, raw_markdown: str) -> WriteStateDocResponse:
         ensure_within_limit(kind, raw_markdown)
-        path = self.doc_path(kind)
+        path = self.doc_path(kind, allow_missing_leaf=True)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(raw_markdown, encoding="utf-8")
         return WriteStateDocResponse(document=self._build_document(kind, raw_markdown, path))
@@ -58,7 +64,7 @@ class StateDocumentService:
             create_missing_sections=create_missing_sections,
         )
         ensure_within_limit(kind, patched)
-        path = self.doc_path(kind)
+        path = self.doc_path(kind, allow_missing_leaf=True)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(patched, encoding="utf-8")
         return PatchStateDocResponse(

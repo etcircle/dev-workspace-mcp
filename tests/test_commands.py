@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import shlex
+import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
+from dev_workspace_mcp.commands.jobs import InMemoryJobStore
+from dev_workspace_mcp.commands.service import CommandService
 from dev_workspace_mcp.config import Settings
+from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.mcp_server.tool_registry import build_tool_registry
+from dev_workspace_mcp.models.commands import CommandTiming, JobRecord
 from dev_workspace_mcp.projects.registry import ProjectRegistry
 
 
-def _build_tools(workspace_root: Path):
-    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+def _build_tools(workspace_root: Path, **settings_overrides):
+    settings = Settings(
+        workspace_roots=[str(workspace_root)],
+        **settings_overrides,
+    )
+    registry = ProjectRegistry(settings)
     registry.refresh()
     return build_tool_registry(registry)
 
@@ -40,6 +52,15 @@ def _stdout_text(job: dict[str, object]) -> str:
         for chunk in output
         if isinstance(chunk, dict) and chunk.get("stream") == "stdout"
     )
+
+
+def _wait_for_job(tools, *, job_id: str, deadline: float = 5.0) -> dict[str, object]:
+    end = time.monotonic() + deadline
+    result = tools.run("get_job", project_id="manifest-id", job_id=job_id)
+    while result["data"]["job"]["status"] == "running" and time.monotonic() < end:
+        time.sleep(0.05)
+        result = tools.run("get_job", project_id="manifest-id", job_id=job_id)
+    return result
 
 
 def test_run_command_foreground_success_and_get_job_returns_completed_record(
@@ -146,6 +167,50 @@ def test_run_command_returns_validation_error_for_unknown_preset(
     assert result["error"]["hint"] == "Use one of the presets exposed by project_snapshot."
 
 
+def test_run_command_returns_validation_error_when_executable_is_missing(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    settings = Settings(workspace_roots=[str(workspace_root)])
+    registry = ProjectRegistry(settings)
+    registry.refresh()
+    job_store = InMemoryJobStore(max_output_bytes=128)
+    service = CommandService(registry, job_store=job_store)
+    missing_python = project_root / "bin" / "python3"
+    _write_policy(
+        project_root,
+        [
+            "command_policy:",
+            "  commands:",
+            "    python3: {}",
+        ],
+    )
+
+    registry.refresh()
+
+    with pytest.raises(DomainError) as exc_info:
+        service.run_command(
+            "manifest-id",
+            argv=[str(missing_python), "-c", "print('nope')"],
+        )
+
+    assert exc_info.value.code == "VALIDATION_ERROR"
+    assert job_store._jobs == {}
+
+    tools = _build_tools(workspace_root)
+    result = tools.run(
+        "run_command",
+        project_id="manifest-id",
+        argv=[str(missing_python), "-c", "print('nope')"],
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "VALIDATION_ERROR"
+    assert "failed to start" in result["error"]["message"]
+
+
+
 def test_background_job_can_be_cancelled_and_get_job_reflects_cancellation(
     workspace_root,
     make_manifest_project,
@@ -190,15 +255,50 @@ def test_background_job_can_be_cancelled_and_get_job_reflects_cancellation(
     assert cancelled_job["status"] == "cancelled"
     assert cancelled_job["timing"]["finished_at"] is not None
 
-    fetched = tools.run("get_job", project_id="manifest-id", job_id=running_job["job_id"])
-    deadline = time.monotonic() + 3
-    while fetched["data"]["job"]["status"] == "running" and time.monotonic() < deadline:
-        time.sleep(0.05)
-        fetched = tools.run("get_job", project_id="manifest-id", job_id=running_job["job_id"])
+    fetched = _wait_for_job(tools, job_id=running_job["job_id"], deadline=3)
 
     assert fetched["ok"] is True
     assert fetched["data"]["job"]["status"] == "cancelled"
     assert fetched["data"]["job"]["exit_code"] is not None
+
+
+def test_cancel_job_does_not_relabel_finished_process_as_cancelled(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    make_manifest_project()
+    settings = Settings(workspace_roots=[str(workspace_root)])
+    registry = ProjectRegistry(settings)
+    registry.refresh()
+    job_store = InMemoryJobStore(max_output_bytes=128)
+    service = CommandService(registry, job_store=job_store)
+
+    job = JobRecord(
+        job_id="finished-job",
+        project_id="manifest-id",
+        argv=[sys.executable, "-c", "print('done')"],
+        cwd=str(workspace_root),
+        status="running",
+        background=True,
+        timing=CommandTiming(started_at=datetime.now(UTC)),
+    )
+    job_store.save(job)
+
+    process = subprocess.Popen(
+        [sys.executable, "-c", "print('done')"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    process.wait(timeout=2)
+    job_store.attach_process(job.job_id, process)
+
+    result = service.cancel_job("manifest-id", job.job_id)
+
+    assert result.job.status == "succeeded"
+    assert result.job.exit_code == 0
+    assert result.job.timing.finished_at is not None
+
 
 
 def test_run_command_denies_cwd_symlink_escape(workspace_root, make_manifest_project) -> None:
@@ -327,3 +427,159 @@ def test_run_command_denies_argv_combinations_blocked_by_project_policy(
 
     assert result["ok"] is False
     assert result["error"]["code"] == "POLICY_DENIED"
+
+
+def test_run_command_bounds_foreground_output_retention(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
+    tools = _build_tools(
+        workspace_root,
+        max_command_output_bytes=128,
+        subprocess_stream_chunk_bytes=32,
+    )
+
+    result = tools.run(
+        "run_command",
+        project_id="manifest-id",
+        argv=[
+            python_cmd,
+            "-c",
+            "import sys; sys.stdout.write(''.join(f'{i:04d}' for i in range(200)))",
+        ],
+    )
+
+    assert result["ok"] is True
+    stdout_text = _stdout_text(result["data"]["job"])
+    assert len(stdout_text.encode("utf-8")) <= 128
+    assert "0000" not in stdout_text
+    assert "0199" in stdout_text
+
+
+def test_run_command_redacts_secret_assignments_across_stream_chunks(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "env:",
+            "  redact: ['MAGICVALUE']",
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
+    tools = _build_tools(
+        workspace_root,
+        subprocess_stream_chunk_bytes=5,
+    )
+
+    result = tools.run(
+        "run_command",
+        project_id="manifest-id",
+        argv=[
+            python_cmd,
+            "-c",
+            "import sys; sys.stdout.write('MAGICVALUE=supersecret')",
+        ],
+    )
+
+    assert result["ok"] is True
+    assert _stdout_text(result["data"]["job"]) == "MAGICVALUE=[REDACTED]"
+
+
+def test_run_command_redacts_long_secret_assignments_without_leaking_tail(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "env:",
+            "  redact: ['MAGICVALUE']",
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
+    tools = _build_tools(
+        workspace_root,
+        subprocess_stream_chunk_bytes=5,
+    )
+
+    result = tools.run(
+        "run_command",
+        project_id="manifest-id",
+        argv=[
+            python_cmd,
+            "-c",
+            "import sys; sys.stdout.write('MAGICVALUE=' + 'A' * 1500)",
+        ],
+    )
+
+    assert result["ok"] is True
+    stdout_text = _stdout_text(result["data"]["job"])
+    assert stdout_text == "MAGICVALUE=[REDACTED]"
+    assert "AAAAA" not in stdout_text
+
+
+def test_background_job_streams_and_bounds_output_retention(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    python_cmd = _make_allowed_python(project_root)
+    _write_policy(
+        project_root,
+        [
+            "command_policy:",
+            "  commands:",
+            f"    {Path(python_cmd).name}: {{}}",
+        ],
+    )
+    tools = _build_tools(
+        workspace_root,
+        max_command_output_bytes=96,
+        subprocess_stream_chunk_bytes=16,
+    )
+
+    run_result = tools.run(
+        "run_command",
+        project_id="manifest-id",
+        argv=[
+            python_cmd,
+            "-c",
+            (
+                "import time\n"
+                "for i in range(40):\n"
+                "    print(f'line-{i:03d}', flush=True)\n"
+                "    time.sleep(0.002)\n"
+            ),
+        ],
+        background=True,
+    )
+
+    assert run_result["ok"] is True
+    finished = _wait_for_job(tools, job_id=run_result["data"]["job"]["job_id"])
+
+    assert finished["ok"] is True
+    assert finished["data"]["job"]["status"] == "succeeded"
+    stdout_text = _stdout_text(finished["data"]["job"])
+    assert len(stdout_text.encode("utf-8")) <= 96
+    assert "line-000" not in stdout_text
+    assert "line-039" in stdout_text
