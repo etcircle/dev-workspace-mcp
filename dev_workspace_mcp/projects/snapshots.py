@@ -11,6 +11,7 @@ from dev_workspace_mcp.models.projects import (
     CapabilitySummary,
     GitSummary,
     ProjectSnapshot,
+    ProjectSnapshotHeader,
     ProjectStackSummary,
     ServiceSummary,
     StateDocSummary,
@@ -77,8 +78,9 @@ _CAPABILITIES = CapabilitySummary(
         "when it has been indexed."
     ),
     github=(
-        "GitHub Issues remain the canonical work tracker, but GitHub remote APIs and write helpers "
-        "are not implemented in this server."
+        "GitHub Issues remain the canonical work tracker, and read-only GitHub repo, issue, "
+        "and PR lookups are available from the project's origin remote. Write helpers are "
+        "still not implemented in this server."
     ),
 )
 
@@ -144,7 +146,12 @@ def build_project_snapshot(
     )
 
     snapshot = ProjectSnapshot(
-        project=record,
+        project=ProjectSnapshotHeader(
+            project_id=record.project_id,
+            display_name=record.display_name,
+            aliases=list(record.aliases),
+            manifest_present=record.manifest_path is not None,
+        ),
         git=git_summary,
         services=services,
         watcher=watcher,

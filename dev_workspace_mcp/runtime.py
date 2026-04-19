@@ -9,6 +9,7 @@ from dev_workspace_mcp.codegraph.service import CodegraphService
 from dev_workspace_mcp.codegraph.watcher_manager import CodegraphWatcherManager
 from dev_workspace_mcp.commands.service import CommandService
 from dev_workspace_mcp.config import Settings, get_settings
+from dev_workspace_mcp.github_tools.service import GitHubService
 from dev_workspace_mcp.http_tools.local_client import LocalHttpClient
 from dev_workspace_mcp.memory_index.service import MemoryIndexService
 from dev_workspace_mcp.probes.service import ProbeService
@@ -27,6 +28,7 @@ class RuntimeServices:
     http_client: LocalHttpClient
     bootstrap_service: ProjectBootstrapService
     connection_service: ProjectConnectionService
+    github_service_factory: Callable[[str], GitHubService]
     memory_index_service_factory: Callable[[str], MemoryIndexService]
 
 
@@ -48,6 +50,14 @@ def create_memory_index_service(
         project_id=project.project_id,
         settings=project_registry.settings,
     )
+
+
+def create_github_service(
+    project_registry: ProjectRegistry,
+    project_id: str,
+) -> GitHubService:
+    project = project_registry.require(project_id)
+    return GitHubService(project.root_path)
 
 
 def create_runtime_services(project_registry: ProjectRegistry) -> RuntimeServices:
@@ -77,6 +87,9 @@ def create_runtime_services(project_registry: ProjectRegistry) -> RuntimeService
     bootstrap_service = ProjectBootstrapService(project_registry)
     connection_service = ProjectConnectionService(project_registry)
 
+    def github_service_factory(project_id: str) -> GitHubService:
+        return create_github_service(project_registry, project_id)
+
     def memory_index_service_factory(project_id: str) -> MemoryIndexService:
         return create_memory_index_service(project_registry, project_id)
 
@@ -88,6 +101,7 @@ def create_runtime_services(project_registry: ProjectRegistry) -> RuntimeService
         http_client=http_client,
         bootstrap_service=bootstrap_service,
         connection_service=connection_service,
+        github_service_factory=github_service_factory,
         memory_index_service_factory=memory_index_service_factory,
     )
 
@@ -108,6 +122,7 @@ def create_runtime(settings: Settings | None = None) -> DevWorkspaceRuntime:
 __all__ = [
     "DevWorkspaceRuntime",
     "RuntimeServices",
+    "create_github_service",
     "create_memory_index_service",
     "create_runtime",
     "create_runtime_services",

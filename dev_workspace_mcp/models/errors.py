@@ -29,6 +29,9 @@ class ErrorCode(StrEnum):
     PROBE_NOT_FOUND = "PROBE_NOT_FOUND"
     GIT_NOT_AVAILABLE = "GIT_NOT_AVAILABLE"
     GIT_OPERATION_FAILED = "GIT_OPERATION_FAILED"
+    GITHUB_REMOTE_NOT_CONFIGURED = "GITHUB_REMOTE_NOT_CONFIGURED"
+    GITHUB_AUTH_REQUIRED = "GITHUB_AUTH_REQUIRED"
+    GITHUB_REQUEST_FAILED = "GITHUB_REQUEST_FAILED"
     HTTP_REQUEST_FAILED = "HTTP_REQUEST_FAILED"
     BOOTSTRAP_FAILED = "BOOTSTRAP_FAILED"
     CONNECTION_NOT_FOUND = "CONNECTION_NOT_FOUND"
@@ -56,6 +59,7 @@ class ErrorDescriptor(BaseModel):
         "commands",
         "services",
         "git",
+        "github",
         "state_docs",
         "internal",
     ] = "internal"

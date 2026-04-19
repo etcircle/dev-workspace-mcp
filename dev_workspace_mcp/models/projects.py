@@ -55,6 +55,13 @@ class ProjectRecord(BaseModel):
     policy: ProjectPolicy = Field(default_factory=ProjectPolicy)
 
 
+class ProjectSnapshotHeader(BaseModel):
+    project_id: str
+    display_name: str
+    aliases: list[str] = Field(default_factory=list)
+    manifest_present: bool = False
+
+
 class ProjectListItem(BaseModel):
     project_id: str
     display_name: str
@@ -90,7 +97,7 @@ class WatcherSummary(BaseModel):
     configured: bool = False
     active: bool = False
     watched_paths: list[str] = Field(default_factory=list)
-    status: Literal["not_configured", "configured", "active", "inactive"] = "not_configured"
+    status: Literal["not_configured", "configured", "indexed", "inactive"] = "not_configured"
     revision: str | None = None
     indexed_at: datetime | None = None
     file_count: int = 0
@@ -123,7 +130,7 @@ class CapabilitySummary(BaseModel):
 
 
 class ProjectSnapshot(BaseModel):
-    project: ProjectRecord
+    project: ProjectSnapshotHeader
     git: GitSummary
     services: list[ServiceSummary] = Field(default_factory=list)
     watcher: WatcherSummary = Field(default_factory=WatcherSummary)
@@ -154,6 +161,7 @@ __all__ = [
     "ProjectManifest",
     "ProjectRecord",
     "ProjectSnapshot",
+    "ProjectSnapshotHeader",
     "ProjectStackSummary",
     "ServiceDefinition",
     "ServiceHealthCheckDefinition",

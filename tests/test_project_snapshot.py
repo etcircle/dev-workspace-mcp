@@ -29,8 +29,16 @@ def test_project_snapshot_warns_when_manifest_and_agents_are_missing(
     result = tools.run("project_snapshot", project_id="git-project")
 
     assert result["ok"] is True
-    assert result["data"]["project"]["project_id"] == "git-project"
-    assert result["data"]["project"]["manifest_path"] is None
+    assert result["data"]["project"] == {
+        "project_id": "git-project",
+        "display_name": "git-project",
+        "aliases": [],
+        "manifest_present": False,
+    }
+    assert "root_path" not in result["data"]["project"]
+    assert "manifest_path" not in result["data"]["project"]
+    assert "manifest" not in result["data"]["project"]
+    assert "policy" not in result["data"]["project"]
     warning_codes = {warning["code"] for warning in result["warnings"]}
     assert {"MANIFEST_MISSING", "AGENTS_MISSING", "GIT_STATUS_UNAVAILABLE"} <= warning_codes
     assert result["data"]["git"]["is_repo"] is True
@@ -155,6 +163,23 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
     registry.refresh()
     tools = build_tool_registry(registry)
 
+    watcher_before_index = tools.run("watcher_health", project_id="manifest-id")
+    assert watcher_before_index["ok"] is True
+    assert watcher_before_index["data"] == {
+        "project_id": "manifest-id",
+        "configured": True,
+        "active": False,
+        "watched_paths": ["src"],
+        "status": "configured",
+        "revision": None,
+        "indexed_at": None,
+        "file_count": 0,
+        "symbol_count": 0,
+    }
+
+    indexed = tools.run("function_context", project_id="manifest-id", symbol="helper")
+    assert indexed["ok"] is True
+
     started = tools.run("start_service", project_id="manifest-id", service_name="backend")
     assert started["ok"] is True
 
@@ -169,6 +194,16 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
 
         assert result["ok"] is True
         assert result["warnings"] == []
+        assert result["data"]["project"] == {
+            "project_id": "manifest-id",
+            "display_name": "Manifest Project",
+            "aliases": ["manifest-id-alias"],
+            "manifest_present": True,
+        }
+        assert "root_path" not in result["data"]["project"]
+        assert "manifest_path" not in result["data"]["project"]
+        assert "manifest" not in result["data"]["project"]
+        assert "policy" not in result["data"]["project"]
         assert result["data"]["services"] == [
             {
                 "name": "backend",
@@ -187,7 +222,8 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
             "package_managers": ["npm", "pip"],
         }
         assert result["data"]["watcher"]["watched_paths"] == ["src"]
-        assert result["data"]["watcher"]["status"] == "active"
+        assert result["data"]["watcher"]["active"] is False
+        assert result["data"]["watcher"]["status"] == "indexed"
         assert result["data"]["watcher"]["file_count"] == 1
         assert result["data"]["watcher"]["symbol_count"] == 3
         assert result["data"]["watcher"]["revision"]
@@ -270,8 +306,9 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
                 "SQLite memory index when it has been indexed."
             ),
             "github": (
-                "GitHub Issues remain the canonical work tracker, but GitHub remote APIs "
-                "and write helpers are not implemented in this server."
+                "GitHub Issues remain the canonical work tracker, and read-only GitHub repo, "
+                "issue, and PR lookups are available from the project's origin remote. "
+                "Write helpers are still not implemented in this server."
             ),
         }
 
@@ -305,6 +342,58 @@ def test_project_snapshot_expands_boot_packet_from_repo_local_sources(
     finally:
         stopped = tools.run("stop_service", project_id="manifest-id", service_name="backend")
         assert stopped["ok"] is True
+
+
+
+def test_watcher_health_only_reports_existing_index_state(
+    workspace_root,
+    make_manifest_project,
+) -> None:
+    project_root = make_manifest_project()
+    src = project_root / "src"
+    src.mkdir()
+    (src / "sample.py").write_text(
+        "def helper():\n"
+        "    return 'ok'\n",
+        encoding="utf-8",
+    )
+
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    tools = build_tool_registry(registry)
+
+    initial = tools.run("watcher_health", project_id="manifest-id")
+
+    assert initial["ok"] is True
+    assert initial["data"] == {
+        "project_id": "manifest-id",
+        "configured": True,
+        "active": False,
+        "watched_paths": ["src"],
+        "status": "configured",
+        "revision": None,
+        "indexed_at": None,
+        "file_count": 0,
+        "symbol_count": 0,
+    }
+
+    context = tools.run("function_context", project_id="manifest-id", symbol="helper")
+
+    assert context["ok"] is True
+
+    indexed = tools.run("watcher_health", project_id="manifest-id")
+
+    assert indexed["ok"] is True
+    assert indexed["data"]["project_id"] == "manifest-id"
+    assert indexed["data"]["configured"] is True
+    assert indexed["data"]["active"] is False
+    assert indexed["data"]["watched_paths"] == ["src"]
+    assert indexed["data"]["status"] == "indexed"
+    assert indexed["data"]["revision"]
+    assert indexed["data"]["indexed_at"]
+    assert indexed["data"]["file_count"] == 1
+    assert indexed["data"]["symbol_count"] == 1
+
 
 
 def test_project_snapshot_adds_compact_memory_hints(

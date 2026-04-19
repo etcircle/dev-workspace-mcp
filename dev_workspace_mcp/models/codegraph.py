@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -82,7 +83,7 @@ class WatcherHealthResponse(BaseModel):
     configured: bool = False
     active: bool = False
     watched_paths: list[str] = Field(default_factory=list)
-    status: str = "not_configured"
+    status: Literal["not_configured", "configured", "indexed", "inactive"] = "not_configured"
     revision: str | None = None
     indexed_at: datetime | None = None
     file_count: int = 0

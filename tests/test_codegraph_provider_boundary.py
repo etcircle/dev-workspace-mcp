@@ -220,11 +220,15 @@ def test_codegraph_service_uses_cached_snapshot_for_function_context(
 
     watcher = service.watcher_health("manifest-id")
     result = service.function_context("manifest-id", "helper")
+    indexed = service.watcher_health("manifest-id")
 
-    assert watcher.revision == "snapshot-rev-1"
+    assert watcher.status == "configured"
+    assert watcher.revision is None
     assert result.symbol == "helper"
     assert result.matches[0].path == "src/example.py"
     assert result.matches[0].signature == "def helper():"
+    assert indexed.status == "indexed"
+    assert indexed.revision == "snapshot-rev-1"
     assert provider.build_snapshot_calls
     assert provider.calls == []
 
@@ -245,14 +249,18 @@ def test_codegraph_service_uses_cached_snapshot_for_reference_queries(
         provider=provider,
     )
 
-    service.watcher_health("manifest-id")
+    watcher = service.watcher_health("manifest-id")
     references = service.find_references("manifest-id", "helper")
     call_path = service.call_path("manifest-id", "helper")
+    indexed = service.watcher_health("manifest-id")
 
+    assert watcher.status == "configured"
+    assert indexed.status == "indexed"
     assert [match.line_text for match in references.matches] == ["    return helper()"]
     assert call_path.definition.path == "src/example.py"
     assert [item.symbol for item in call_path.incoming] == ["caller"]
     assert call_path.outgoing == []
+    assert len(provider.build_snapshot_calls) == 1
     assert provider.find_reference_calls == []
     assert provider.call_path_calls == []
 
@@ -278,11 +286,20 @@ def test_codegraph_service_rebuilds_snapshot_when_watched_files_change(
         provider=provider,
     )
 
+    initial = service.function_context("manifest-id", "helper")
     first = service.watcher_health("manifest-id")
     sample.write_text("def helper():\n    return 2\n", encoding="utf-8")
+    stale = service.watcher_health("manifest-id")
+    updated = service.function_context("manifest-id", "helper")
     second = service.watcher_health("manifest-id")
 
+    assert initial.matches[0].source.endswith("return 1")
+    assert first.status == "indexed"
     assert first.revision == "snapshot-rev-1"
+    assert stale.status == "configured"
+    assert stale.revision is None
+    assert updated.matches[0].source.endswith("return 2")
+    assert second.status == "indexed"
     assert second.revision == "snapshot-rev-2"
     assert len(provider.build_snapshot_calls) == 2
 
@@ -308,10 +325,11 @@ def test_codegraph_service_rebuilds_snapshot_before_cached_query_after_file_chan
         provider=provider,
     )
 
-    service.watcher_health("manifest-id")
+    first = service.function_context("manifest-id", "helper")
     sample.write_text("def helper():\n    return 2\n", encoding="utf-8")
     result = service.function_context("manifest-id", "helper")
 
+    assert first.matches[0].source.endswith("return 1")
     assert len(provider.build_snapshot_calls) == 2
     assert result.matches[0].source.endswith("return 2")
     assert service.index_manager.get_snapshot("manifest-id").revision == "snapshot-rev-2"

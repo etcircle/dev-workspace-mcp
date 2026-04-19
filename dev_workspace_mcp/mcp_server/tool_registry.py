@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 from dev_workspace_mcp.codegraph.service import CodegraphService
 from dev_workspace_mcp.commands.service import CommandService
 from dev_workspace_mcp.files.service import FileService
+from dev_workspace_mcp.github_tools.service import GitHubService
 from dev_workspace_mcp.gittools.service import GitService
 from dev_workspace_mcp.http_tools.local_client import LocalHttpClient
 from dev_workspace_mcp.mcp_server.errors import DomainError
@@ -21,6 +22,13 @@ from dev_workspace_mcp.models.connections import (
     TestConnectionRequest,
 )
 from dev_workspace_mcp.models.errors import ErrorCode, ValidationIssue
+from dev_workspace_mcp.models.github import (
+    GitHubIssueReadRequest,
+    GitHubIssueSearchRequest,
+    GitHubPrFilesRequest,
+    GitHubPrReadRequest,
+    GitHubRepoRequest,
+)
 from dev_workspace_mcp.models.memory_index import (
     MemoryIndexStatusRequest,
     RecordSessionSummaryRequest,
@@ -93,6 +101,7 @@ def build_tool_registry(
     http_client = runtime_services.http_client
     bootstrap_service = runtime_services.bootstrap_service
     connection_service = runtime_services.connection_service
+    github_service_factory = runtime_services.github_service_factory
     memory_index_service_factory = runtime_services.memory_index_service_factory
 
     registry.register(
@@ -204,6 +213,44 @@ def build_tool_registry(
                     include_untracked=include_untracked,
                 )
             ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="github_issue_read",
+            description="Read one GitHub issue from the project's origin repository.",
+            handler=_make_github_issue_read_handler(project_registry, github_service_factory),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="github_issue_search",
+            description="Search GitHub issues in the project's origin repository.",
+            handler=_make_github_issue_search_handler(project_registry, github_service_factory),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="github_pr_files",
+            description=(
+                "List files for one GitHub pull request in the project's origin "
+                "repository."
+            ),
+            handler=_make_github_pr_files_handler(project_registry, github_service_factory),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="github_pr_read",
+            description="Read one GitHub pull request from the project's origin repository.",
+            handler=_make_github_pr_read_handler(project_registry, github_service_factory),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="github_repo",
+            description="Read GitHub repository details resolved from the project's origin remote.",
+            handler=_make_github_repo_handler(project_registry, github_service_factory),
         )
     )
     registry.register(
@@ -674,6 +721,110 @@ def _make_test_connection_handler(connection_service) -> ToolHandler:
     return _handler
 
 
+def _make_github_repo_handler(project_registry, github_service_factory) -> ToolHandler:
+    def _handler(project_id) -> dict[str, Any]:
+        request = _validated_model(
+            GitHubRepoRequest,
+            {"project_id": project_id},
+            tool_name="github_repo",
+        )
+        return ok(
+            _with_github_service(
+                project_registry,
+                request.project_id,
+                github_service_factory=github_service_factory,
+                callback=lambda service: service.get_repo(),
+            )
+        )
+
+    return _handler
+
+
+def _make_github_issue_read_handler(project_registry, github_service_factory) -> ToolHandler:
+    def _handler(project_id, issue_number) -> dict[str, Any]:
+        request = _validated_model(
+            GitHubIssueReadRequest,
+            {"project_id": project_id, "issue_number": issue_number},
+            tool_name="github_issue_read",
+        )
+        return ok(
+            _with_github_service(
+                project_registry,
+                request.project_id,
+                github_service_factory=github_service_factory,
+                callback=lambda service: service.read_issue(request.issue_number),
+            )
+        )
+
+    return _handler
+
+
+def _make_github_issue_search_handler(project_registry, github_service_factory) -> ToolHandler:
+    def _handler(project_id, query, state="open", limit=10) -> dict[str, Any]:
+        request = _validated_model(
+            GitHubIssueSearchRequest,
+            {
+                "project_id": project_id,
+                "query": query,
+                "state": state,
+                "limit": limit,
+            },
+            tool_name="github_issue_search",
+        )
+        return ok(
+            _with_github_service(
+                project_registry,
+                request.project_id,
+                github_service_factory=github_service_factory,
+                callback=lambda service: service.search_issues(
+                    request.query,
+                    state=request.state,
+                    limit=request.limit,
+                ),
+            )
+        )
+
+    return _handler
+
+
+def _make_github_pr_read_handler(project_registry, github_service_factory) -> ToolHandler:
+    def _handler(project_id, pr_number) -> dict[str, Any]:
+        request = _validated_model(
+            GitHubPrReadRequest,
+            {"project_id": project_id, "pr_number": pr_number},
+            tool_name="github_pr_read",
+        )
+        return ok(
+            _with_github_service(
+                project_registry,
+                request.project_id,
+                github_service_factory=github_service_factory,
+                callback=lambda service: service.read_pr(request.pr_number),
+            )
+        )
+
+    return _handler
+
+
+def _make_github_pr_files_handler(project_registry, github_service_factory) -> ToolHandler:
+    def _handler(project_id, pr_number) -> dict[str, Any]:
+        request = _validated_model(
+            GitHubPrFilesRequest,
+            {"project_id": project_id, "pr_number": pr_number},
+            tool_name="github_pr_files",
+        )
+        return ok(
+            _with_github_service(
+                project_registry,
+                request.project_id,
+                github_service_factory=github_service_factory,
+                callback=lambda service: service.list_pr_files(request.pr_number),
+            )
+        )
+
+    return _handler
+
+
 def _make_memory_index_status_handler(memory_index_service_factory) -> ToolHandler:
     def _handler(project_id) -> dict[str, Any]:
         request = _validated_model(
@@ -901,11 +1052,41 @@ def _git_service(project_registry, project_id: str) -> GitService:
     return GitService(Path(project.root_path), max_diff_bytes=max_diff_bytes)
 
 
+def _github_service(
+    project_registry,
+    project_id: str,
+    *,
+    github_service_factory=None,
+) -> GitHubService:
+    if github_service_factory is not None:
+        return github_service_factory(project_id)
+    project = project_registry.require(project_id)
+    return GitHubService(Path(project.root_path))
+
+
+def _with_github_service(
+    project_registry,
+    project_id: str,
+    *,
+    github_service_factory=None,
+    callback: Callable[[GitHubService], Any],
+) -> Any:
+    service = _github_service(
+        project_registry,
+        project_id,
+        github_service_factory=github_service_factory,
+    )
+    try:
+        return callback(service)
+    finally:
+        close = getattr(service, "close", None)
+        if callable(close):
+            close()
+
 
 def _state_doc_service(project_registry, project_id: str) -> StateDocumentService:
     project = project_registry.require(project_id)
     return StateDocumentService(Path(project.root_path))
-
 
 
 def _state_doc_kind(kind: str | StateDocKind) -> StateDocKind:

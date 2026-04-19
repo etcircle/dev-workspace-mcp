@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -47,6 +48,7 @@ class CodegraphWatchState(BaseModel):
 
     project_id: str
     active: bool = False
+    status: Literal["not_configured", "configured", "indexed", "inactive"] = "not_configured"
     watched_paths: list[str] = Field(default_factory=list)
     revision: str | None = None
     indexed_at: datetime | None = None

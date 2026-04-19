@@ -6,6 +6,7 @@ from pathlib import Path
 from dev_workspace_mcp.config import Settings
 from dev_workspace_mcp.mcp_server.tool_registry import build_tool_registry
 from dev_workspace_mcp.projects.registry import ProjectRegistry
+from dev_workspace_mcp.runtime import create_runtime_services
 
 SAMPLE_SOURCE = '''import os
 from pathlib import Path
@@ -133,19 +134,69 @@ def test_recent_changes_and_watcher_health(workspace_root, make_manifest_project
     subprocess.run(["git", "-C", str(project_root), "commit", "-m", "initial"], check=True)
     sample.write_text(SAMPLE_SOURCE + "\n# changed\n", encoding="utf-8")
 
-    tools = _build_tools(workspace_root)
+    registry = ProjectRegistry(Settings(workspace_roots=[str(workspace_root)]))
+    registry.refresh()
+    runtime_services = create_runtime_services(registry)
+    tools = build_tool_registry(registry, services=runtime_services)
 
     recent = tools.run("recent_changes", project_id="manifest-id", path="src/sample.py")
     assert recent["ok"] is True
     assert "diff --git a/src/sample.py b/src/sample.py" in recent["data"]["diff"]
     assert "+# changed" in recent["data"]["diff"]
 
+    watcher_manager = runtime_services.codegraph_service.watcher_manager
+    state_before = watcher_manager.get_state("manifest-id").model_dump(mode="json")
+    assert state_before == {
+        "project_id": "manifest-id",
+        "active": False,
+        "status": "not_configured",
+        "watched_paths": [],
+        "revision": None,
+        "indexed_at": None,
+        "file_count": 0,
+        "symbol_count": 0,
+    }
+
     watcher = tools.run("watcher_health", project_id="manifest-id")
     assert watcher["ok"] is True
     assert watcher["data"]["project_id"] == "manifest-id"
     assert watcher["data"]["configured"] is True
+    assert watcher["data"]["active"] is False
     assert watcher["data"]["watched_paths"] == ["src"]
-    assert watcher["data"]["file_count"] == 1
-    assert watcher["data"]["symbol_count"] == 4
-    assert watcher["data"]["revision"]
-    assert watcher["data"]["indexed_at"]
+    assert watcher["data"]["status"] == "configured"
+    assert watcher["data"]["file_count"] == 0
+    assert watcher["data"]["symbol_count"] == 0
+    assert watcher["data"]["revision"] is None
+    assert watcher["data"]["indexed_at"] is None
+    assert watcher_manager.get_state("manifest-id").model_dump(mode="json") == state_before
+
+    context = tools.run("function_context", project_id="manifest-id", symbol="helper")
+    assert context["ok"] is True
+
+    indexed = tools.run("watcher_health", project_id="manifest-id")
+    assert indexed["ok"] is True
+    assert indexed["data"]["project_id"] == "manifest-id"
+    assert indexed["data"]["configured"] is True
+    assert indexed["data"]["active"] is False
+    assert indexed["data"]["watched_paths"] == ["src"]
+    assert indexed["data"]["status"] == "indexed"
+    assert indexed["data"]["file_count"] == 1
+    assert indexed["data"]["symbol_count"] == 4
+    assert indexed["data"]["revision"]
+    assert indexed["data"]["indexed_at"]
+
+    sample.write_text(SAMPLE_SOURCE + "\n# changed again\n", encoding="utf-8")
+
+    stale = tools.run("watcher_health", project_id="manifest-id")
+    assert stale["ok"] is True
+    assert stale["data"] == {
+        "project_id": "manifest-id",
+        "configured": True,
+        "active": False,
+        "watched_paths": ["src"],
+        "status": "configured",
+        "revision": None,
+        "indexed_at": None,
+        "file_count": 0,
+        "symbol_count": 0,
+    }

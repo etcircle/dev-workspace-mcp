@@ -20,6 +20,7 @@ from dev_workspace_mcp.models.codegraph import (
 )
 from dev_workspace_mcp.models.errors import ErrorCode
 from dev_workspace_mcp.projects.registry import ProjectRegistry
+from dev_workspace_mcp.shared.paths import resolve_project_path
 
 
 @dataclass(slots=True)
@@ -133,34 +134,46 @@ class CodegraphService:
         project = self.project_registry.require(project_id)
         project_root = Path(project.root_path)
         watched_paths = list(project.manifest.codegraph.watch_paths)
-        configured = bool(watched_paths)
-        if configured:
-            snapshot = self._ensure_snapshot(project_id, project_root, watched_paths)
-            state = self.watcher_manager.start(project_id, watched_paths, snapshot=snapshot)
-            status = "active" if state.active else "inactive"
+        for watched_path in watched_paths:
+            resolve_project_path(project_root, watched_path)
+        state = self.watcher_manager.get_state(project_id)
+        if not watched_paths:
+            return WatcherHealthResponse(
+                project_id=project_id,
+                configured=False,
+                active=False,
+                watched_paths=[],
+                status="not_configured",
+                revision=None,
+                indexed_at=None,
+                file_count=0,
+                symbol_count=0,
+            )
+
+        snapshot = self.index_manager.get_snapshot(project_id)
+        if self._snapshot_is_indexed_for_watch_paths(snapshot, project_root, watched_paths):
             return WatcherHealthResponse(
                 project_id=project_id,
                 configured=True,
-                active=state.active,
-                watched_paths=state.watched_paths,
-                status=status,
-                revision=state.revision,
-                indexed_at=state.indexed_at,
-                file_count=state.file_count,
-                symbol_count=state.symbol_count,
+                active=False,
+                watched_paths=list(state.watched_paths or watched_paths),
+                status="indexed",
+                revision=snapshot.revision,
+                indexed_at=snapshot.indexed_at,
+                file_count=snapshot.file_count,
+                symbol_count=snapshot.symbol_count,
             )
 
-        state = self.watcher_manager.get_state(project_id)
         return WatcherHealthResponse(
             project_id=project_id,
-            configured=False,
-            active=state.active,
-            watched_paths=state.watched_paths,
-            status="not_configured",
-            revision=state.revision,
-            indexed_at=state.indexed_at,
-            file_count=state.file_count,
-            symbol_count=state.symbol_count,
+            configured=True,
+            active=False,
+            watched_paths=list(state.watched_paths or watched_paths),
+            status="inactive" if state.status == "inactive" else "configured",
+            revision=None,
+            indexed_at=None,
+            file_count=0,
+            symbol_count=0,
         )
 
     def _ensure_snapshot(
@@ -173,9 +186,8 @@ class CodegraphService:
         if not watched_paths:
             return snapshot
         current_state_token = self.index_manager.compute_state_token(project_root, watched_paths)
-        if snapshot.state_token == current_state_token and (
-            snapshot.nodes or snapshot.edges or snapshot.revision
-        ):
+        if snapshot.state_token == current_state_token and self._snapshot_has_index(snapshot):
+            self.watcher_manager.start(project_id, watched_paths, snapshot=snapshot)
             return snapshot
         snapshot = self.provider.build_index_snapshot(
             project_id,
@@ -184,7 +196,34 @@ class CodegraphService:
         )
         snapshot.state_token = current_state_token
         self.index_manager.record_snapshot(snapshot)
+        self.watcher_manager.start(project_id, watched_paths, snapshot=snapshot)
         return snapshot
+
+    def _snapshot_is_indexed_for_watch_paths(
+        self,
+        snapshot: CodegraphIndexSnapshot,
+        project_root: Path,
+        watched_paths: list[str],
+    ) -> bool:
+        if (
+            not watched_paths
+            or not self._snapshot_has_index(snapshot)
+            or snapshot.state_token is None
+        ):
+            return False
+        current_state_token = self.index_manager.compute_state_token(project_root, watched_paths)
+        return snapshot.state_token == current_state_token
+
+    @staticmethod
+    def _snapshot_has_index(snapshot: CodegraphIndexSnapshot) -> bool:
+        return bool(
+            snapshot.nodes
+            or snapshot.edges
+            or snapshot.revision
+            or snapshot.indexed_at
+            or snapshot.file_count
+            or snapshot.symbol_count
+        )
 
     def _function_context_from_snapshot(
         self,

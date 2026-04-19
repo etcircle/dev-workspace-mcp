@@ -3,8 +3,13 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from dev_workspace_mcp.config import Settings
+from dev_workspace_mcp.gittools.service import GitService
+from dev_workspace_mcp.mcp_server.errors import DomainError
 from dev_workspace_mcp.mcp_server.tool_registry import build_tool_registry
+from dev_workspace_mcp.models.errors import ErrorCode
 from dev_workspace_mcp.projects.registry import ProjectRegistry
 
 
@@ -114,3 +119,61 @@ def test_git_commit_stages_relative_paths_and_returns_commit_metadata(
     status = tools.run("git_status", project_id="git-project")
     assert status["ok"] is True
     assert status["data"]["clean"] is True
+
+
+@pytest.mark.parametrize(
+    ("origin_url", "owner", "repo"),
+    [
+        ("https://github.com/example-org/demo-repo.git", "example-org", "demo-repo"),
+        ("git@github.com:example-org/demo-repo.git", "example-org", "demo-repo"),
+        ("ssh://git@github.com/example-org/demo-repo", "example-org", "demo-repo"),
+    ],
+)
+def test_git_service_resolves_supported_github_origin_formats(
+    make_git_project,
+    origin_url: str,
+    owner: str,
+    repo: str,
+) -> None:
+    project_root = make_git_project(real_git=True)
+    _init_git_history(project_root)
+    subprocess.run(
+        ["git", "-C", str(project_root), "remote", "add", "origin", origin_url],
+        check=True,
+    )
+
+    resolved = GitService(project_root).resolve_github_origin()
+
+    assert resolved.owner == owner
+    assert resolved.repo == repo
+    assert resolved.origin_url == origin_url
+
+
+def test_git_service_errors_when_origin_is_missing_or_not_github(make_git_project) -> None:
+    missing_origin_root = make_git_project(name="missing-origin", real_git=True)
+    _init_git_history(missing_origin_root)
+
+    with pytest.raises(DomainError) as missing_exc:
+        GitService(missing_origin_root).resolve_github_origin()
+
+    assert missing_exc.value.code == ErrorCode.GITHUB_REMOTE_NOT_CONFIGURED
+
+    non_github_root = make_git_project(name="not-github", real_git=True)
+    _init_git_history(non_github_root)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(non_github_root),
+            "remote",
+            "add",
+            "origin",
+            "https://gitlab.com/example-org/demo-repo.git",
+        ],
+        check=True,
+    )
+
+    with pytest.raises(DomainError) as non_github_exc:
+        GitService(non_github_root).resolve_github_origin()
+
+    assert non_github_exc.value.code == ErrorCode.GITHUB_REMOTE_NOT_CONFIGURED

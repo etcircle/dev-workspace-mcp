@@ -7,6 +7,13 @@ This tracker is the current-wave execution fence for the peer-review implementat
 Canonical architecture/source plan:
 - `.hermes/plans/2026-04-18_125142-dev-workspace-mcp-peer-review-implementation-plan.md`
 
+Execution status note:
+- Waves 1-4 in this tracker are historical/background only.
+- In particular, the old Wave 4 boot-packet direction below is **not** the active execution artifact anymore.
+- Use the current 2026-04-19 execution pair instead:
+  - `docs/plans/2026-04-19-truthful-boot-packet-and-github-readonly-implementation-plan.md`
+  - `docs/plans/2026-04-19-truthful-boot-packet-and-github-readonly-wave-tracker.md`
+
 This tracker is narrower than the broad plan. If a wave needs additional files, the parent agent must amend this tracker before delegating.
 
 ## Current repo state at wave start

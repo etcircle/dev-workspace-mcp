@@ -15,9 +15,15 @@ from dev_workspace_mcp.models.git import (
     GitFileChange,
     GitStatusResponse,
 )
+from dev_workspace_mcp.models.github import GitHubRepoRef
 
 _BRANCH_PATTERN = re.compile(
     r"^(?P<branch>[^.]+?)(?:\.\.\.(?P<upstream>[^\[]+?))?(?: \[(?P<tracking>.+)\])?$"
+)
+_GITHUB_ORIGIN_PATTERNS = (
+    re.compile(r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"),
+    re.compile(r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$"),
+    re.compile(r"^ssh://git@github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"),
 )
 
 
@@ -156,6 +162,44 @@ class GitService:
             check=False,
         )
         return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def origin_remote_url(self) -> str:
+        self._require_git()
+        result = subprocess.run(
+            ["git", "-C", str(self.project_root), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        origin_url = result.stdout.strip()
+        if result.returncode != 0 or not origin_url:
+            raise DomainError(
+                code=ErrorCode.GITHUB_REMOTE_NOT_CONFIGURED,
+                message="Project git origin remote is not configured.",
+                hint="Set the project's git origin remote to a GitHub repository URL.",
+                details={"project_root": str(self.project_root)},
+            )
+        return origin_url
+
+    def resolve_github_origin(self) -> GitHubRepoRef:
+        origin_url = self.origin_remote_url()
+        for pattern in _GITHUB_ORIGIN_PATTERNS:
+            match = pattern.match(origin_url)
+            if match:
+                return GitHubRepoRef(
+                    owner=match.group("owner"),
+                    repo=match.group("repo"),
+                    origin_url=origin_url,
+                )
+        raise DomainError(
+            code=ErrorCode.GITHUB_REMOTE_NOT_CONFIGURED,
+            message="Project git origin remote is not a supported GitHub repository URL.",
+            hint=(
+                "Use a GitHub origin like https://github.com/owner/repo.git or "
+                "git@github.com:owner/repo.git."
+            ),
+            details={"origin_url": origin_url, "project_root": str(self.project_root)},
+        )
 
     def _current_checkout(self) -> GitCheckoutResponse:
         branch = self._run_git(["branch", "--show-current"]).stdout.strip() or None

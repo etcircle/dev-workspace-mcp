@@ -16,7 +16,9 @@ Dev Workspace MCP gives agents a safer, structured way to inspect, edit, run, an
 - Declared development services with start, stop, restart, status, health, and logs
 - Local HTTP verification and manifest-declared probes
 - Local git helpers for status, diff, checkout, and commit
+- Read-only GitHub repo, issue, and pull-request tools resolved from each project's origin remote
 - Repo-local state files for memory, roadmap, and tasks
+- A persistent workspace memory index (`SQLite` + `FTS5`) for canonical docs and recorded session summaries
 - MCP over Streamable HTTP or stdio
 - A small CLI that uses the same runtime as the MCP tools
 
@@ -39,13 +41,14 @@ Implemented today:
 - local git tools
 - direct connection profiles
 - repo-local state documents
+- persistent workspace memory index (`SQLite` + `FTS5`) with status, reindex, search, and session-summary recording
 - small JSON-first CLI
 
 Not implemented yet / still open:
 
 - SSH tunnel lifecycle management
-- GitHub issue, PR, review, or Actions tools
-- persistent SQLite/BM25 search
+- GitHub read-only repo/issue/PR tools are implemented, but GitHub write tools and Actions/logs tools are still absent
+- real filesystem watcher backend (current watcher state is metadata only; no live file watching)
 - durable job/log storage across server restarts
 - full CLI parity with every MCP tool
 - remote/public authentication and authorization for hosted exposure
@@ -116,6 +119,8 @@ python -m dev_workspace_mcp.app cli --json snapshot scratch-api
 python -m dev_workspace_mcp.app cli --json read scratch-api README.md
 python -m dev_workspace_mcp.app cli --json git status scratch-api
 python -m dev_workspace_mcp.app cli --json memory read scratch-api
+python -m dev_workspace_mcp.app cli --json memory-index status scratch-api
+python -m dev_workspace_mcp.app cli --json memory-index search scratch-api --query "postgres"
 ```
 
 Run an allowed command and patch memory:
@@ -192,6 +197,8 @@ connections:
       type: tcp
       timeout_sec: 3
 ```
+
+`codegraph.watch_paths` declares the intended indexing scope. The current repo can surface watcher/index metadata and snapshot-backed semantic data, but it still does **not** have a real live filesystem watcher backend.
 
 ## Command policy
 
